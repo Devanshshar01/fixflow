@@ -1,1 +1,184 @@
-[]
+[
+    [
+  {
+    "id": "node_missing_script",
+    "pattern": "npm ERR! missing script:\\s+(\\S+)",
+    "category": "node",
+    "severity": "critical",
+    "root_cause": "The '{match[1]}' script is not defined in package.json",
+    "fix": "Add a '{match[1]}' entry to the 'scripts' block in your package.json",
+    "fix_url": "https://docs.npmjs.com/cli/v10/configuring-npm/package-json#scripts",
+    "prevention": "Keep package.json scripts in sync across branches and validate in CI",
+    "is_active": true,
+    "strict_ecosystem": false
+  },
+  {
+    "id": "node_registry_unreachable",
+    "pattern": "npm ERR! code ENOTFOUND",
+    "category": "node",
+    "severity": "high",
+    "root_cause": "npm registry is unreachable — likely a transient network issue in the CI runner",
+    "fix": "Add retry logic: use 'npm install --prefer-offline' or configure '--registry https://registry.npmjs.org' explicitly. Re-running the workflow often resolves this.",
+    "fix_url": "https://docs.npmjs.com/cli/v10/using-npm/config#registry",
+    "prevention": "Pin registry in .npmrc and add a retry step in your workflow",
+    "is_active": true,
+    "strict_ecosystem": false
+  },
+  {
+    "id": "node_cannot_find_module",
+    "pattern": "Cannot find module '([^']+)'",
+    "category": "node",
+    "severity": "critical",
+    "root_cause": "Module '{match[1]}' is missing from node_modules — not installed or wrong import path",
+    "fix": "Run 'npm install' and ensure '{match[1]}' is listed in dependencies or devDependencies. Check for typos in the import path.",
+    "fix_url": "https://nodejs.org/api/modules.html",
+    "prevention": "Commit your package-lock.json and use 'npm ci' instead of 'npm install' in CI",
+    "is_active": true,
+    "strict_ecosystem": false
+  },
+  {
+    "id": "node_typescript_error",
+    "pattern": "error TS(\\d+):",
+    "category": "node",
+    "severity": "high",
+    "root_cause": "TypeScript compiler error TS{match[1]} — type mismatch or missing type definitions",
+    "fix": "Run 'npx tsc --noEmit' locally to see the full error. Check if you need to install a '@types/*' package for the affected module.",
+    "fix_url": "https://www.typescriptlang.org/tsconfig",
+    "prevention": "Run 'tsc --noEmit' as a pre-commit hook to catch type errors before push",
+    "is_active": true,
+    "strict_ecosystem": false
+  },
+  {
+    "id": "python_module_not_found",
+    "pattern": "ModuleNotFoundError: No module named '([^']+)'",
+    "category": "python",
+    "severity": "critical",
+    "root_cause": "Python package '{match[1]}' is not installed — missing from requirements.txt or not installed in CI",
+    "fix": "Add '{match[1]}' to requirements.txt (with a pinned version) and run 'pip install -r requirements.txt' in your workflow before the failing step.",
+    "fix_url": "https://pip.pypa.io/en/stable/reference/requirements-file-format/",
+    "prevention": "Use 'pip freeze > requirements.txt' to capture exact versions and cache pip in CI",
+    "is_active": true,
+    "strict_ecosystem": false
+  },
+  {
+    "id": "python_version_conflict",
+    "pattern": "Could not find a version that satisfies the requirement (\\S+)",
+    "category": "python",
+    "severity": "high",
+    "root_cause": "No compatible version of '{match[1]}' exists for the current Python version or constraint set",
+    "fix": "Relax the version pin for '{match[1]}' in requirements.txt or check PyPI for available versions compatible with your Python version.",
+    "fix_url": "https://pypi.org",
+    "prevention": "Use 'pip-compile' (pip-tools) to generate a lockfile with fully resolved dependencies",
+    "is_active": true,
+    "strict_ecosystem": false
+  },
+  {
+    "id": "docker_copy_failed",
+    "pattern": "COPY failed.*: file not found in build context",
+    "category": "docker",
+    "severity": "critical",
+    "root_cause": "A file or directory referenced in a COPY instruction does not exist relative to the Docker build context",
+    "fix": "Check the COPY source path is relative to your build context (the directory passed to 'docker build'). Run 'docker build --no-cache .' locally to reproduce.",
+    "fix_url": "https://docs.docker.com/engine/reference/builder/#copy",
+    "prevention": "Add a .dockerignore file and test Docker builds locally before pushing",
+    "is_active": true,
+    "strict_ecosystem": false
+  },
+  {
+    "id": "docker_rate_limit",
+    "pattern": "toomanyrequests.*docker\\.io|You have reached your pull rate limit",
+    "category": "docker",
+    "severity": "high",
+    "root_cause": "Docker Hub anonymous pull rate limit reached (100 pulls/6 hours per IP for unauthenticated requests)",
+    "fix": "Add Docker Hub authentication to your workflow: create a secret DOCKERHUB_TOKEN and add a 'docker/login-action' step before any image pulls.",
+    "fix_url": "https://docs.docker.com/docker-hub/download-rate-limit/",
+    "prevention": "Always authenticate to Docker Hub in CI and consider mirroring base images to GitHub Container Registry",
+    "is_active": true,
+    "strict_ecosystem": false
+  },
+  {
+    "id": "actions_missing_permissions",
+    "pattern": "Resource not accessible by integration",
+    "category": "permissions",
+    "severity": "critical",
+    "root_cause": "The GitHub Actions workflow token lacks the required permission for this operation",
+    "fix": "Add a 'permissions' block to your workflow YAML. For example: 'permissions: pull-requests: write' for PR comments, or 'contents: write' for pushing.",
+    "fix_url": "https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#permissions",
+    "prevention": "Always declare explicit permissions in workflow files — avoids relying on default token scopes",
+    "is_active": true,
+    "strict_ecosystem": false
+  },
+  {
+    "id": "actions_git_auth_failed",
+    "pattern": "fatal: could not read Username for 'https://github.com'",
+    "category": "permissions",
+    "severity": "high",
+    "root_cause": "Git operations in this step are not authenticated — GITHUB_TOKEN is not being passed to the git credential helper",
+    "fix": "Use 'actions/checkout' with 'token: ${{ secrets.GITHUB_TOKEN }}' or set 'git config --global url.https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/.insteadOf https://github.com/'",
+    "fix_url": "https://github.com/actions/checkout",
+    "prevention": "Always use 'actions/checkout' for git operations and pass GITHUB_TOKEN explicitly",
+    "is_active": true,
+    "strict_ecosystem": false
+  },
+  {
+    "id": "env_var_missing",
+    "pattern": "(?:Error|error).*environment variable[s]? ([A-Z_]{3,}) (?:is )?(?:not set|missing|undefined)",
+    "category": "secrets",
+    "severity": "critical",
+    "root_cause": "Environment variable '{match[1]}' is not set in this workflow run",
+    "fix": "Add '{match[1]}' as a GitHub Actions secret: go to your repo → Settings → Secrets and variables → Actions → New repository secret. Then reference it in your workflow with '${{ secrets.{match[1]} }}'.",
+    "fix_url": "https://docs.github.com/en/actions/security-guides/encrypted-secrets",
+    "prevention": "Document required secrets in your README and validate them at workflow start with a dedicated check step",
+    "is_active": true,
+    "strict_ecosystem": false
+  },
+  {
+    "id": "pytest_no_tests",
+    "pattern": "collected 0 items",
+    "category": "testing",
+    "severity": "medium",
+    "root_cause": "pytest collected zero test files — file naming or pytest.ini configuration doesn't match your test files",
+    "fix": "Ensure test files follow pytest naming conventions: files must be named 'test_*.py' or '*_test.py'. Check your pytest.ini or pyproject.toml [tool.pytest.ini_options] testpaths setting.",
+    "fix_url": "https://docs.pytest.org/en/stable/explanation/goodpractices.html",
+    "prevention": "Add a CI check that fails if 0 tests are collected: 'pytest --collect-only -q | grep -E \"^[0-9]+ tests\"'",
+    "is_active": true,
+    "strict_ecosystem": false
+  },
+  {
+    "id": "jest_no_tests",
+    "pattern": "jest.*no tests found|Your test suite must contain at least one test",
+    "category": "testing",
+    "severity": "medium",
+    "root_cause": "Jest found no test files matching your testMatch or testRegex configuration",
+    "fix": "Check your jest.config.js 'testMatch' glob pattern. Default matches '**/__tests__/**/*.[jt]s?(x)' and '**/?(*.)+(spec|test).[jt]s?(x)'. Rename your test files to match.",
+    "fix_url": "https://jestjs.io/docs/configuration#testmatch-arraystring",
+    "prevention": "Keep test file naming consistent and validate the config with 'jest --listTests' locally",
+    "is_active": true,
+    "strict_ecosystem": false
+  },
+  {
+    "id": "node_lockfile_missing",
+    "pattern": "npm ERR!.*package-lock\\.json|npm WARN.*no lockfile",
+    "category": "node",
+    "severity": "high",
+    "root_cause": "package-lock.json is missing or not committed — npm cannot perform a clean install",
+    "fix": "Run 'npm install' locally to generate package-lock.json, then commit it. Use 'npm ci' instead of 'npm install' in CI for reproducible installs.",
+    "fix_url": "https://docs.npmjs.com/cli/v10/commands/npm-ci",
+    "prevention": "Never add package-lock.json to .gitignore and enforce 'npm ci' in all CI workflows",
+    "is_active": true,
+    "strict_ecosystem": false
+  },
+  {
+    "id": "port_already_in_use",
+    "pattern": "EADDRINUSE|address already in use|port (\\d+) is already in use",
+    "category": "node",
+    "severity": "medium",
+    "root_cause": "A port is already bound — likely a previous test run or service didn't shut down cleanly in CI",
+    "fix": "Kill the process using the port before starting your service: 'npx kill-port {match[1]}' or use a dynamic port in tests.",
+    "fix_url": "https://nodejs.org/api/net.html",
+    "prevention": "Use 'server.close()' in test teardown and prefer random ports (port: 0) in integration tests",
+    "is_active": true,
+    "strict_ecosystem": false
+  }
+]
+]
