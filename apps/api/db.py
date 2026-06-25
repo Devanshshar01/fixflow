@@ -1,13 +1,14 @@
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+import ssl
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy import text
 
 from config import get_settings
 from logger import logger
@@ -19,24 +20,30 @@ class Base(DeclarativeBase):
 
 def _create_engine():
     settings = get_settings()
+
+    ssl_context = ssl.create_default_context()
+
     return create_async_engine(
         settings.database_url,
-        echo=not settings.is_production,  # Log SQL in dev only
+        echo=not settings.is_production,
         pool_size=10,
         max_overflow=20,
-        pool_pre_ping=True,   # Verify connection before using from pool
-        pool_recycle=3600,    # Recycle connections every hour
+        pool_pre_ping=True,
+        pool_recycle=3600,
+        connect_args={
+            "ssl": ssl_context,
+        },
     )
 
 
 engine = _create_engine()
 
 AsyncSessionLocal = async_sessionmaker(
-    engine,
+    bind=engine,
     class_=AsyncSession,
     expire_on_commit=False,
-    autocommit=False,
     autoflush=False,
+    autocommit=False,
 )
 
 
@@ -48,8 +55,6 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
         except Exception:
             await session.rollback()
             raise
-        finally:
-            await session.close()
 
 
 async def check_db_connection() -> bool:
