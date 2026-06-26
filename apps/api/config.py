@@ -15,14 +15,19 @@ class Settings(BaseSettings):
     )
 
     # ──────────────────────────────────────────────────────────────
-    # GitHub App (Optional during development)
+    # GitHub App
     # ──────────────────────────────────────────────────────────────
 
     github_app_id: Optional[str] = None
     github_client_id: Optional[str] = None
     github_client_secret: Optional[str] = None
     github_webhook_secret: Optional[str] = None
+
+    # Local development
     github_app_private_key_path: Optional[str] = None
+
+    # Production (Render)
+    github_app_private_key: Optional[str] = None
 
     # ──────────────────────────────────────────────────────────────
     # Database
@@ -35,11 +40,11 @@ class Settings(BaseSettings):
     # ──────────────────────────────────────────────────────────────
 
     gemini_api_key: Optional[str] = None
-    ai_provider: str = "gemini"  # gemini | ollama
+    ai_provider: str = "gemini"
     ollama_url: str = "http://localhost:11434"
 
     # ──────────────────────────────────────────────────────────────
-    # Application
+    # App
     # ──────────────────────────────────────────────────────────────
 
     environment: str = "development"
@@ -52,7 +57,7 @@ class Settings(BaseSettings):
 
     @field_validator("github_app_private_key_path")
     @classmethod
-    def private_key_must_exist(cls, v):
+    def validate_private_key_path(cls, v):
         if not v:
             return v
 
@@ -65,7 +70,7 @@ class Settings(BaseSettings):
 
     @field_validator("database_url")
     @classmethod
-    def fix_postgres_scheme(cls, v: str) -> str:
+    def fix_postgres_scheme(cls, v: str):
         if v.startswith("postgres://"):
             return v.replace("postgres://", "postgresql+asyncpg://", 1)
 
@@ -80,10 +85,22 @@ class Settings(BaseSettings):
 
     @property
     def github_private_key(self) -> str:
-        if not self.github_app_private_key_path:
-            return ""
+        """
+        Priority:
+        1. Environment variable (Render)
+        2. Local PEM file
+        """
 
-        return Path(self.github_app_private_key_path).read_text()
+        if self.github_app_private_key:
+            return self.github_app_private_key.replace("\\n", "\n")
+
+        if self.github_app_private_key_path:
+            return Path(self.github_app_private_key_path).read_text()
+
+        raise ValueError(
+            "No GitHub private key configured. "
+            "Set GITHUB_APP_PRIVATE_KEY or GITHUB_APP_PRIVATE_KEY_PATH."
+        )
 
     @property
     def is_production(self) -> bool:

@@ -2,18 +2,20 @@
 Webhook router — the core of FixFlow.
 
 Flow per failed workflow_run:
-1. Verify HMAC-SHA256 signature
-2. Return 200 immediately (GitHub will retry on non-200 or timeout >10s)
-3. Background task:
-   a. Idempotency check
-   b. Upsert repository record
-   c. Create WorkflowRun with status=pending
-   d. Download + parse logs
-   e. Redact secrets
-   f. Rule engine → if match, skip AI
-   g. AI fallback if no rule match
-   h. Format + post PR comment
-   i. Update WorkflowRun status=completed
+1.  Verify HMAC-SHA256 signature
+2.  Return 200 immediately
+3.  Background task:
+    a.  Idempotency check
+    b.  Upsert repository record
+    c.  Create WorkflowRun (status=analyzing)
+    d.  Post placeholder PR comment
+    e.  Download + parse logs
+    f.  Redact secrets
+    g.  Rule engine → increment hit count on match
+    h.  AI fallback if no rule match
+    i.  Format and post/update PR comment
+    j.  Persist FailureAnalysis
+    k.  Mark WorkflowRun status=completed
 """
 
 import hashlib
@@ -22,23 +24,24 @@ import json
 import time
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request, Depends
+from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from config import get_settings
-from db import get_db, AsyncSessionLocal
+from db import AsyncSessionLocal
 from logger import logger
 from models.database import Installation, Repository, WorkflowRun, FailureAnalysis
 from services import github as gh
 from services.log_parser import parse_log_zip
 from services.redactor import redact
-from services.rule_engine import match as rule_match
+from services.rule_engine import match as rule_match, increment_hit_count
 from services.ai_analyzer import get_analyzer, AnalysisContext, AIAnalysisError
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 
-# ── Signature verification ────────────────────────────────────────────────────
+
+# ── Signature verification ─────────────────────────────────────────────────────
 
 def verify_webhook_signature(payload: bytes, signature_header: str, secret: str) -> bool:
     if not signature_header or not signature_header.startswith("sha256="):
@@ -49,7 +52,7 @@ def verify_webhook_signature(payload: bytes, signature_header: str, secret: str)
     return hmac.compare_digest(expected, signature_header)
 
 
-# ── Comment formatter ─────────────────────────────────────────────────────────
+# ── Comment formatters ─────────────────────────────────────────────────────────
 
 def _format_pr_comment(
     *,
@@ -65,9 +68,6 @@ def _format_pr_comment(
     analysis_ms: int,
     ecosystem: str,
 ) -> str:
-    """Build the full markdown body for the PR comment."""
-
-    # Confidence badge
     if confidence is None or source == "rule_engine":
         confidence_line = "🟢 **Matched known pattern** — deterministic fix"
     elif confidence >= 75:
@@ -81,19 +81,19 @@ def _format_pr_comment(
     if cascading_steps:
         steps_str = ", ".join(f"`{s}`" for s in cascading_steps[:3])
         more = f" and {len(cascading_steps) - 3} more" if len(cascading_steps) > 3 else ""
-        cascading_note = f"\n> ℹ️ **Cascading failures** also detected in: {steps_str}{more} — fixing the root step above should resolve these.\n"
+        cascading_note = (
+            f"\n> ℹ️ **Cascading failures** also detected in: "
+            f"{steps_str}{more} — fixing the root step above should resolve these.\n"
+        )
 
     redaction_note = (
-        f"\n> 🔒 **{redaction_count} secret{'s' if redaction_count != 1 else ''} redacted** before analysis\n"
+        f"\n> 🔒 **{redaction_count} secret"
+        f"{'s' if redaction_count != 1 else ''} redacted** before analysis\n"
         if redaction_count > 0
         else ""
     )
 
-    prevention_section = (
-        f"\n**Prevention**\n{prevention}\n"
-        if prevention
-        else ""
-    )
+    prevention_section = f"\n**Prevention**\n{prevention}\n" if prevention else ""
 
     source_label = {
         "rule_engine": "Rule engine (deterministic)",
@@ -129,14 +129,12 @@ def _format_degraded_comment(
     reason: str,
     redaction_count: int,
 ) -> str:
-    """Fallback comment when AI fails or confidence is too low."""
     redaction_note = (
-        f"\n> 🔒 **{redaction_count} secret{'s' if redaction_count != 1 else ''} redacted** before display\n"
+        f"\n> 🔒 **{redaction_count} secret"
+        f"{'s' if redaction_count != 1 else ''} redacted** before display\n"
         if redaction_count > 0
         else ""
     )
-
-    # Truncate snippet for display
     lines = redacted_snippet.splitlines()
     display = "\n".join(lines[:40])
     truncated = len(lines) > 40
@@ -156,26 +154,27 @@ def _format_degraded_comment(
 """
 
 
-# ── Background analysis pipeline ──────────────────────────────────────────────
+# ── Core analysis pipeline ─────────────────────────────────────────────────────
 
 async def _run_analysis_pipeline(
     payload: dict,
     installation_id: int,
 ) -> None:
     """
-    Full analysis pipeline. Runs as a background task.
-    Opens its own DB session — BackgroundTasks run after the request is closed.
+    Full analysis pipeline. Opens its own DB session because BackgroundTasks
+    run after the request/response cycle is closed.
     """
     start_time = time.monotonic()
     run_data = payload.get("workflow_run", {})
     repo_data = payload.get("repository", {})
     github_run_id = run_data.get("id")
-    owner, repo_name = repo_data.get("full_name", "/").split("/", 1)
+    full_name = repo_data.get("full_name", "/")
+    owner, repo_name = full_name.split("/", 1)
 
     with logger.contextualize(
         github_run_id=github_run_id,
         installation_id=installation_id,
-        repo=repo_data.get("full_name"),
+        repo=full_name,
     ):
         async with AsyncSessionLocal() as db:
             try:
@@ -195,12 +194,13 @@ async def _run_analysis_pipeline(
             except Exception as exc:
                 await db.rollback()
                 logger.error(
-                    "Analysis pipeline failed",
+                    "Analysis pipeline failed — unhandled exception",
                     error=str(exc),
                     exc_info=True,
                 )
-                # Mark run as failed in DB so it can be retried
-                await _mark_run_failed(db, github_run_id, str(exc))
+                async with AsyncSessionLocal() as err_db:
+                    await _mark_run_failed(err_db, github_run_id, str(exc))
+                    await err_db.commit()
 
 
 async def _pipeline(
@@ -216,29 +216,25 @@ async def _pipeline(
     start_time: float,
 ) -> None:
 
-    # ── Step 1: Idempotency check ──────────────────────────────────────────────
+    # ── 1. Idempotency ─────────────────────────────────────────────────────────
     existing = await db.execute(
         select(WorkflowRun).where(WorkflowRun.github_run_id == github_run_id)
     )
     if existing.scalar_one_or_none():
-        logger.info("Skipping — run already processed")
+        logger.info("Skipping — already processed (idempotency guard)")
         return
 
-    # ── Step 2: Resolve installation record ────────────────────────────────────
-    installation_row = await db.execute(
-        select(Installation).where(
-            Installation.installation_id == installation_id
-        )
+    # ── 2. Resolve installation ────────────────────────────────────────────────
+    inst_result = await db.execute(
+        select(Installation).where(Installation.installation_id == installation_id)
     )
-    installation_obj = installation_row.scalar_one_or_none()
+    installation_obj = inst_result.scalar_one_or_none()
 
-    # ── Step 3: Upsert repository ──────────────────────────────────────────────
-    repo_row = await db.execute(
-        select(Repository).where(
-            Repository.github_repo_id == repo_data.get("id")
-        )
+    # ── 3. Upsert repository ───────────────────────────────────────────────────
+    repo_result = await db.execute(
+        select(Repository).where(Repository.github_repo_id == repo_data.get("id"))
     )
-    repo_obj = repo_row.scalar_one_or_none()
+    repo_obj = repo_result.scalar_one_or_none()
 
     if not repo_obj:
         repo_obj = Repository(
@@ -248,10 +244,10 @@ async def _pipeline(
             default_branch=repo_data.get("default_branch", "main"),
         )
         db.add(repo_obj)
-        await db.flush()   # Get the ID without committing
+        await db.flush()
         logger.info("New repository registered", repo=repo_data["full_name"])
 
-    # ── Step 4: Create WorkflowRun record (status=pending) ────────────────────
+    # ── 4. Create WorkflowRun ──────────────────────────────────────────────────
     pr_list = run_data.get("pull_requests", [])
     pr_number = pr_list[0]["number"] if pr_list else None
 
@@ -269,23 +265,21 @@ async def _pipeline(
     await db.flush()
 
     logger.info(
-        "WorkflowRun created",
+        "WorkflowRun record created",
         run_id=str(workflow_run.id),
         pr_number=pr_number,
         workflow=run_data.get("name"),
     )
 
-    # ── Step 5: Post placeholder comment immediately ───────────────────────────
+    # ── 5. Placeholder PR comment ──────────────────────────────────────────────
     placeholder_comment_id: int | None = None
     if pr_number:
-        # Check for existing fixflow comment first (idempotency on comments)
-        existing_comment_id = await gh.find_existing_fixflow_comment(
+        existing_cid = await gh.find_existing_fixflow_comment(
             installation_id, owner, repo_name, pr_number
         )
-
-        if existing_comment_id:
-            placeholder_comment_id = existing_comment_id
-            logger.info("Reusing existing FixFlow comment", comment_id=existing_comment_id)
+        if existing_cid:
+            placeholder_comment_id = existing_cid
+            logger.info("Reusing existing FixFlow comment", comment_id=existing_cid)
         else:
             placeholder_body = (
                 "<!-- fixflow:managed -->\n"
@@ -301,23 +295,26 @@ async def _pipeline(
             except gh.GitHubAPIError as exc:
                 logger.warning("Could not post placeholder comment", error=str(exc))
 
-    # ── Step 6: Download and parse logs ───────────────────────────────────────
+    # ── 6. Download logs ───────────────────────────────────────────────────────
     try:
         zip_bytes = await gh.download_logs_zip(
             installation_id, owner, repo_name, github_run_id
         )
     except gh.LogsNotFoundError:
-        logger.warning("Logs not found — may have expired")
-        await _mark_run_failed(db, github_run_id, "logs_expired")
+        logger.warning("Logs not found — may have expired (>90 days)")
+        workflow_run.status = "failed"
+        workflow_run.error_detail = "logs_expired"
         return
     except gh.GitHubAPIError as exc:
         logger.error("Log download failed", error=str(exc))
-        await _mark_run_failed(db, github_run_id, f"log_download_failed: {exc}")
+        workflow_run.status = "failed"
+        workflow_run.error_detail = f"log_download_failed: {exc}"
         return
 
+    # ── 7. Parse logs ──────────────────────────────────────────────────────────
     parsed = parse_log_zip(zip_bytes)
 
-    # ── Step 7: Redact secrets ─────────────────────────────────────────────────
+    # ── 8. Redact ──────────────────────────────────────────────────────────────
     redaction_result = redact(parsed.snippet)
     clean_snippet = redaction_result.text
     redaction_count = redaction_result.count
@@ -328,13 +325,13 @@ async def _pipeline(
         categories=redaction_result.categories,
     )
 
-    # ── Step 8: Rule engine ────────────────────────────────────────────────────
+    # ── 9. Rule engine ─────────────────────────────────────────────────────────
     rule_result = rule_match(clean_snippet, parsed.ecosystem)
 
     analysis_source = "unknown"
     root_cause = "Unable to determine root cause"
-    fix = "Review the log snippet above for details"
-    prevention = None
+    fix = "Review the log snippet above for more details"
+    prevention: str | None = None
     category = "unknown"
     confidence: int | None = None
     rule_id: str | None = None
@@ -348,6 +345,9 @@ async def _pipeline(
         confidence = 100
         rule_id = rule_result.rule_id
 
+        # Increment hit count — non-blocking
+        await increment_hit_count(rule_id, db)
+
         logger.info(
             "Rule engine resolved failure",
             rule_id=rule_id,
@@ -355,8 +355,8 @@ async def _pipeline(
         )
 
     else:
-        # ── Step 9: AI fallback ────────────────────────────────────────────────
-        logger.info("No rule match — falling back to AI")
+        # ── 10. AI fallback ────────────────────────────────────────────────────
+        logger.info("No rule match — falling back to AI analyzer")
         try:
             analyzer = get_analyzer()
             ai_result = await analyzer.analyze(
@@ -385,14 +385,17 @@ async def _pipeline(
             logger.error("AI analysis failed", error=str(exc))
             analysis_source = "degraded"
 
-    # ── Step 10: Build and post/update PR comment ──────────────────────────────
+    # ── 11. Build comment ──────────────────────────────────────────────────────
     analysis_ms = round((time.monotonic() - start_time) * 1000)
 
     if analysis_source == "degraded":
         comment_body = _format_degraded_comment(
             failed_step=parsed.root_step.name if parsed.root_step else None,
             redacted_snippet=clean_snippet,
-            reason="Rule engine had no match and AI analysis failed. Showing redacted log snippet.",
+            reason=(
+                "Rule engine had no match and AI analysis failed. "
+                "Showing redacted log snippet."
+            ),
             redaction_count=redaction_count,
         )
     else:
@@ -410,20 +413,22 @@ async def _pipeline(
             ecosystem=parsed.ecosystem,
         )
 
+    # ── 12. Post/update PR comment ─────────────────────────────────────────────
     if pr_number:
         try:
             if placeholder_comment_id:
                 await gh.update_pr_comment(
-                    installation_id, owner, repo_name, placeholder_comment_id, comment_body
+                    installation_id, owner, repo_name,
+                    placeholder_comment_id, comment_body,
                 )
             else:
                 placeholder_comment_id = await gh.post_pr_comment(
-                    installation_id, owner, repo_name, pr_number, comment_body
+                    installation_id, owner, repo_name, pr_number, comment_body,
                 )
         except gh.GitHubAPIError as exc:
             logger.error("Failed to post/update PR comment", error=str(exc))
 
-    # ── Step 11: Persist FailureAnalysis record ────────────────────────────────
+    # ── 13. Persist FailureAnalysis ────────────────────────────────────────────
     failure_analysis = FailureAnalysis(
         run_id=workflow_run.id,
         error_category=category,
@@ -438,18 +443,20 @@ async def _pipeline(
     )
     db.add(failure_analysis)
 
-    # ── Step 12: Mark WorkflowRun as completed ─────────────────────────────────
+    # ── 14. Mark WorkflowRun completed ────────────────────────────────────────
     workflow_run.status = "completed"
     workflow_run.analyzed_at = datetime.now(timezone.utc)
     workflow_run.analysis_ms = analysis_ms
     workflow_run.comment_posted = pr_number is not None
 
     logger.info(
-        "Analysis pipeline complete",
+        "Pipeline complete",
         run_id=str(workflow_run.id),
         source=analysis_source,
+        category=category,
         analysis_ms=analysis_ms,
         comment_posted=workflow_run.comment_posted,
+        redactions=redaction_count,
     )
 
 
@@ -462,11 +469,10 @@ async def _mark_run_failed(
     run = result.scalar_one_or_none()
     if run:
         run.status = "failed"
-        run.error_detail = reason
-        await db.commit()
+        run.error_detail = reason[:500]
 
 
-# ── Webhook entry point ───────────────────────────────────────────────────────
+# ── Webhook entry point ────────────────────────────────────────────────────────
 
 @router.post("/github")
 async def github_webhook(
@@ -523,7 +529,7 @@ async def github_webhook(
                     )
             else:
                 logger.debug(
-                    "Skipping workflow_run",
+                    "Skipping workflow_run — not a completed failure",
                     action=action,
                     conclusion=conclusion,
                 )
@@ -552,6 +558,3 @@ async def github_webhook(
             logger.debug("Unhandled event", event=x_github_event)
 
     return {"status": "accepted", "delivery_id": x_github_delivery}
-
-
-import json  # noqa: E402 — used in pipeline, placed here to avoid circular at module top
