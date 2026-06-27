@@ -1,5 +1,8 @@
+from routers import health, webhooks, repositories, analytics
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
+import asyncio
+import importlib
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,7 +12,9 @@ from config import get_settings
 from db import lifespan_db, AsyncSessionLocal
 from logger import logger, setup_logging
 from models.database import WorkflowRun
-from routers import health, webhooks, repositories, analytics
+
+
+STARTUP_STEP_TIMEOUT_SECONDS = 15
 
 
 async def _requeue_stuck_runs() -> None:
@@ -22,15 +27,18 @@ async def _requeue_stuck_runs() -> None:
     reset them here. A separate process can then re-drive them — for now we
     just reset status so they're visible and don't block analytics.
     """
+    logger.info("Startup re-queue: start")
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=2)
 
     async with AsyncSessionLocal() as db:
+        logger.info("Startup re-queue: querying stuck runs")
         result = await db.execute(
             select(WorkflowRun).where(
                 WorkflowRun.status.in_(["analyzing", "pending"]),
                 WorkflowRun.triggered_at < cutoff,
             )
         )
+        logger.info("Startup re-queue: query completed")
         stuck_runs = result.scalars().all()
 
         if not stuck_runs:
@@ -49,6 +57,7 @@ async def _requeue_stuck_runs() -> None:
             count=len(stuck_runs),
             run_ids=[str(r.id) for r in stuck_runs],
         )
+    logger.info("Startup re-queue: end")
 
 
 @asynccontextmanager
