@@ -17,7 +17,10 @@ Flow per failed workflow_run:
     j.  Persist FailureAnalysis
     k.  Mark WorkflowRun status=completed
 """
+from sqlalchemy import select
 
+from db import AsyncSessionLocal
+from models.database import User, Installation, Repository
 import hashlib
 import hmac
 import json
@@ -536,19 +539,107 @@ async def github_webhook(
 
         case "installation":
             action = payload.get("action")
-            inst = payload.get("installation", {})
+
+            if action != "created":
+                return
+
+            installation_data = payload["installation"]
+            account = payload["installation"]["account"]
+
+            async with AsyncSessionLocal() as db:
+
+                result = await db.execute(
+                    select(User).where(User.github_id == account["id"])
+                )
+
+                user = result.scalar_one_or_none()
+
+                if not user:
+                    user = User(
+                        github_id=account["id"],
+                        login=account["login"],
+                        name=account.get("name"),
+                        avatar_url=account.get("avatar_url"),
+                    )
+
+                    db.add(user)
+                    await db.flush()
+
+                result = await db.execute(
+                    select(Installation).where(
+                        Installation.installation_id == installation_data["id"]
+                    )
+                )
+
+                existing_installation = result.scalar_one_or_none()
+
+                if not existing_installation:
+                    db.add(
+                        Installation(
+                            installation_id=installation_data["id"],
+                            user_id=user.id,
+                            account_login=account["login"],
+                            account_type=account["type"],
+                        )
+                    )
+
+                await db.commit()
+
             logger.info(
-                "Installation event",
-                action=action,
-                installation_id=inst.get("id"),
-                account=inst.get("account", {}).get("login"),
+                "Installation saved",
+                installation_id=installation_data["id"],
+                account=account["login"],
             )
 
         case "installation_repositories":
+            installation_data = payload["installation"]
+
+            async with AsyncSessionLocal() as db:
+
+                result = await db.execute(
+                    select(Installation).where(
+                        Installation.installation_id == installation_data["id"]
+                    )
+                )
+
+                installation = result.scalar_one_or_none()
+
+                if not installation:
+                    logger.error(
+                        "Installation not found",
+                        installation_id=installation_data["id"],
+                    )
+                    return
+
+                for repo in payload.get("repositories_added", []):
+
+                    existing = await db.execute(
+                        select(Repository).where(
+                            Repository.github_repo_id == repo["id"]
+                        )
+                    )
+
+                    if existing.scalar_one_or_none():
+                        continue
+
+                    db.add(
+                        Repository(
+                            installation_id=installation.id,
+                            github_repo_id=repo["id"],
+                            full_name=repo["full_name"],
+                            default_branch=repo.get(
+                                "default_branch",
+                                "main",
+                            ),
+                            is_active=True,
+                        )
+                    )
+
+                await db.commit()
+
             logger.info(
-                "Repositories changed",
-                added=len(payload.get("repositories_added", [])),
-                removed=len(payload.get("repositories_removed", [])),
+                "Repositories saved",
+                count=len(payload.get("repositories_added", [])),
             )
 
         case "ping":
