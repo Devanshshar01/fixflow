@@ -594,6 +594,12 @@ async def github_webhook(
         case "installation_repositories":
             installation_data = payload["installation"]
 
+            logger.info(
+                "installation_repositories received",
+                installation_id=installation_data["id"],
+                repos_added=len(payload.get("repositories_added", [])),
+            )
+
             async with AsyncSessionLocal() as db:
 
                 result = await db.execute(
@@ -611,7 +617,19 @@ async def github_webhook(
                     )
                     return
 
+                logger.info(
+                    "Installation found",
+                    installation_id=installation.installation_id,
+                    db_id=str(installation.id),
+                )
+
                 for repo in payload.get("repositories_added", []):
+
+                    logger.info(
+                        "Processing repository",
+                        repo_name=repo["full_name"],
+                        repo_id=repo["id"],
+                    )
 
                     existing = await db.execute(
                         select(Repository).where(
@@ -620,6 +638,10 @@ async def github_webhook(
                     )
 
                     if existing.scalar_one_or_none():
+                        logger.info(
+                            "Repository already exists",
+                            repo_id=repo["id"],
+                        )
                         continue
 
                     db.add(
@@ -633,6 +655,11 @@ async def github_webhook(
                             ),
                             is_active=True,
                         )
+                    )
+
+                    logger.info(
+                        "Repository queued for insert",
+                        repo_name=repo["full_name"],
                     )
 
                 await db.commit()
