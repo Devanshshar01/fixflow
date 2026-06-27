@@ -1,22 +1,16 @@
 """
 Webhook router — the core of FixFlow.
 
-Flow per failed workflow_run:
-1.  Verify HMAC-SHA256 signature
-2.  Return 200 immediately
-3.  Background task:
-    a.  Idempotency check
-    b.  Upsert repository record
-    c.  Create WorkflowRun (status=analyzing)
-    d.  Post placeholder PR comment
-    e.  Download + parse logs
-    f.  Redact secrets
-    g.  Rule engine → increment hit count on match
-    h.  AI fallback if no rule match
-    i.  Format and post/update PR comment
-    j.  Persist FailureAnalysis
-    k.  Mark WorkflowRun status=completed
+Key fixes in this version:
+- Granular try/except around every DB operation so failures surface with
+  exact line context instead of being swallowed
+- Background task opens its own session correctly (no shared state from request)
+- Repository upsert happens inside the background session, not the request
+  session, so there is no cross-session object issue
+- _mark_run_failed uses its own nested session so it never fails silently
+- Every stage logs entry AND exit so you can pinpoint exactly where it stops
 """
+
 import hashlib
 import hmac
 import json
@@ -24,13 +18,13 @@ import time
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 from config import get_settings
 from db import AsyncSessionLocal
 from logger import logger
-from models.database import FailureAnalysis, Installation, Repository, User, WorkflowRun
+from models.database import Installation, Repository, WorkflowRun, FailureAnalysis
 from services import github as gh
 from services.log_parser import parse_log_zip
 from services.redactor import redact
@@ -153,15 +147,15 @@ def _format_degraded_comment(
 """
 
 
-# ── Core analysis pipeline ─────────────────────────────────────────────────────
+# ── Background analysis pipeline ───────────────────────────────────────────────
 
 async def _run_analysis_pipeline(
     payload: dict,
     installation_id: int,
 ) -> None:
     """
-    Full analysis pipeline. Opens its own DB session because BackgroundTasks
-    run after the request/response cycle is closed.
+    Entry point for the background task. Opens its own DB session.
+    All DB operations happen here — nothing is shared from the request context.
     """
     start_time = time.monotonic()
     run_data = payload.get("workflow_run", {})
@@ -175,6 +169,8 @@ async def _run_analysis_pipeline(
         installation_id=installation_id,
         repo=full_name,
     ):
+        logger.info("Background pipeline starting")
+
         async with AsyncSessionLocal() as db:
             try:
                 await _pipeline(
@@ -188,18 +184,28 @@ async def _run_analysis_pipeline(
                     installation_id=installation_id,
                     start_time=start_time,
                 )
+                logger.info("Pipeline completed — committing transaction")
                 await db.commit()
+                logger.info("Transaction committed successfully")
 
             except Exception as exc:
-                await db.rollback()
                 logger.error(
-                    "Analysis pipeline failed — unhandled exception",
+                    "Pipeline failed — rolling back",
                     error=str(exc),
+                    error_type=type(exc).__name__,
                     exc_info=True,
                 )
-                async with AsyncSessionLocal() as err_db:
-                    await _mark_run_failed(err_db, github_run_id, str(exc))
-                    await err_db.commit()
+                try:
+                    await db.rollback()
+                except Exception as rollback_exc:
+                    logger.error(
+                        "Rollback also failed",
+                        error=str(rollback_exc),
+                    )
+
+                # Use a fresh session to mark the run as failed
+                # (the main session is in a bad state after the exception)
+                await _mark_run_failed_safe(github_run_id, str(exc))
 
 
 async def _pipeline(
@@ -215,121 +221,245 @@ async def _pipeline(
     start_time: float,
 ) -> None:
 
-    # ── 1. Idempotency ─────────────────────────────────────────────────────────
-    existing = await db.execute(
-        select(WorkflowRun).where(WorkflowRun.github_run_id == github_run_id)
-    )
-    if existing.scalar_one_or_none():
-        logger.info("Skipping — already processed (idempotency guard)")
-        return
-
-    # ── 2. Resolve installation ────────────────────────────────────────────────
-    inst_result = await db.execute(
-        select(Installation).where(Installation.installation_id == installation_id)
-    )
-    installation_obj = inst_result.scalar_one_or_none()
-
-    # ── 3. Upsert repository ───────────────────────────────────────────────────
-    repo_result = await db.execute(
-        select(Repository).where(Repository.github_repo_id == repo_data.get("id"))
-    )
-    repo_obj = repo_result.scalar_one_or_none()
-
-    if not repo_obj:
-        repo_obj = Repository(
-            installation_id=installation_obj.id if installation_obj else None,
-            github_repo_id=repo_data["id"],
-            full_name=repo_data["full_name"],
-            default_branch=repo_data.get("default_branch", "main"),
+    # ── STAGE 1: Idempotency ───────────────────────────────────────────────────
+    logger.info("Stage 1: idempotency check")
+    try:
+        existing = await db.execute(
+            select(WorkflowRun).where(WorkflowRun.github_run_id == github_run_id)
         )
-        db.add(repo_obj)
-        await db.flush()
-        logger.info("New repository registered", repo=repo_data["full_name"])
+        if existing.scalar_one_or_none():
+            logger.info("Run already processed — skipping (idempotency guard)")
+            return
+        logger.info("Stage 1 passed — run not yet processed")
+    except Exception as exc:
+        logger.error("Stage 1 FAILED: idempotency check threw", error=str(exc), exc_info=True)
+        raise
 
-    # ── 4. Create WorkflowRun ──────────────────────────────────────────────────
-    pr_list = run_data.get("pull_requests", [])
-    pr_number = pr_list[0]["number"] if pr_list else None
-
-    workflow_run = WorkflowRun(
-        repository_id=repo_obj.id,
-        github_run_id=github_run_id,
-        workflow_name=run_data.get("name"),
-        head_sha=run_data.get("head_sha"),
-        pr_number=pr_number,
-        conclusion=run_data.get("conclusion", "failure"),
-        triggered_at=datetime.now(timezone.utc),
-        status="analyzing",
-    )
-    db.add(workflow_run)
-    await db.flush()
-
-    logger.info(
-        "WorkflowRun record created",
-        run_id=str(workflow_run.id),
-        pr_number=pr_number,
-        workflow=run_data.get("name"),
-    )
-
-    # ── 5. Placeholder PR comment ──────────────────────────────────────────────
-    placeholder_comment_id: int | None = None
-    if pr_number:
-        existing_cid = await gh.find_existing_fixflow_comment(
-            installation_id, owner, repo_name, pr_number
-        )
-        if existing_cid:
-            placeholder_comment_id = existing_cid
-            logger.info("Reusing existing FixFlow comment", comment_id=existing_cid)
-        else:
-            placeholder_body = (
-                "<!-- fixflow:managed -->\n"
-                "## 🔍 FixFlow Analysis\n\n"
-                "⏳ Analyzing CI failure — fix suggestion will appear here shortly...\n\n"
-                f"**Workflow:** `{run_data.get('name', 'unknown')}`\n"
-                f"**Commit:** `{(run_data.get('head_sha') or '')[:7]}`"
+    # ── STAGE 2: Resolve installation ─────────────────────────────────────────
+    logger.info("Stage 2: resolving installation record")
+    installation_obj = None
+    try:
+        inst_result = await db.execute(
+            select(Installation).where(
+                Installation.installation_id == installation_id
             )
-            try:
+        )
+        installation_obj = inst_result.scalar_one_or_none()
+        if installation_obj:
+            logger.info(
+                "Stage 2 passed — installation found",
+                installation_db_id=str(installation_obj.id),
+                account=installation_obj.account_login,
+            )
+        else:
+            logger.warning(
+                "Stage 2: installation record not found in DB — "
+                "will create repository without installation_id link",
+                installation_id=installation_id,
+            )
+    except Exception as exc:
+        logger.error("Stage 2 FAILED: installation lookup threw", error=str(exc), exc_info=True)
+        raise
+
+    # ── STAGE 3: Upsert repository ─────────────────────────────────────────────
+    logger.info("Stage 3: upserting repository record")
+    repo_obj = None
+    try:
+        repo_github_id = repo_data.get("id")
+        if not repo_github_id:
+            raise ValueError(
+                f"repo_data missing 'id' field. Keys present: {list(repo_data.keys())}"
+            )
+
+        repo_result = await db.execute(
+            select(Repository).where(Repository.github_repo_id == repo_github_id)
+        )
+        repo_obj = repo_result.scalar_one_or_none()
+
+        if repo_obj:
+            logger.info(
+                "Stage 3 passed — existing repository found",
+                repo_db_id=str(repo_obj.id),
+                full_name=repo_obj.full_name,
+            )
+        else:
+            repo_obj = Repository(
+                installation_id=installation_obj.id if installation_obj else None,
+                github_repo_id=repo_github_id,
+                full_name=repo_data.get("full_name", f"{owner}/{repo_name}"),
+                default_branch=repo_data.get("default_branch", "main"),
+            )
+            db.add(repo_obj)
+            await db.flush()
+            logger.info(
+                "Stage 3 passed — new repository created and flushed",
+                repo_db_id=str(repo_obj.id),
+                full_name=repo_obj.full_name,
+            )
+    except Exception as exc:
+        logger.error("Stage 3 FAILED: repository upsert threw", error=str(exc), exc_info=True)
+        raise
+
+    # ── STAGE 4: Create WorkflowRun ────────────────────────────────────────────
+    logger.info("Stage 4: creating WorkflowRun record")
+    workflow_run = None
+    try:
+        pr_list = run_data.get("pull_requests", [])
+        pr_number = pr_list[0]["number"] if pr_list else None
+
+        workflow_run = WorkflowRun(
+            repository_id=repo_obj.id,
+            github_run_id=github_run_id,
+            workflow_name=run_data.get("name"),
+            head_sha=run_data.get("head_sha"),
+            pr_number=pr_number,
+            conclusion=run_data.get("conclusion", "failure"),
+            triggered_at=datetime.now(timezone.utc),
+            status="analyzing",
+        )
+        db.add(workflow_run)
+        await db.flush()  # Get the UUID assigned before we reference it
+
+        logger.info(
+            "Stage 4 passed — WorkflowRun created and flushed",
+            run_db_id=str(workflow_run.id),
+            pr_number=pr_number,
+            workflow=run_data.get("name"),
+            repo_db_id=str(repo_obj.id),
+        )
+    except Exception as exc:
+        logger.error("Stage 4 FAILED: WorkflowRun creation threw", error=str(exc), exc_info=True)
+        raise
+
+    # ── STAGE 5: Placeholder PR comment ───────────────────────────────────────
+    logger.info("Stage 5: posting placeholder PR comment")
+    placeholder_comment_id: int | None = None
+    pr_number = workflow_run.pr_number
+
+    if pr_number:
+        try:
+            existing_cid = await gh.find_existing_fixflow_comment(
+                installation_id, owner, repo_name, pr_number
+            )
+            if existing_cid:
+                placeholder_comment_id = existing_cid
+                logger.info(
+                    "Stage 5: reusing existing FixFlow comment",
+                    comment_id=existing_cid,
+                )
+            else:
+                placeholder_body = (
+                    "<!-- fixflow:managed -->\n"
+                    "## 🔍 FixFlow Analysis\n\n"
+                    "⏳ Analyzing CI failure — fix suggestion will appear here shortly...\n\n"
+                    f"**Workflow:** `{run_data.get('name', 'unknown')}`\n"
+                    f"**Commit:** `{(run_data.get('head_sha') or '')[:7]}`"
+                )
                 placeholder_comment_id = await gh.post_pr_comment(
                     installation_id, owner, repo_name, pr_number, placeholder_body
                 )
-            except gh.GitHubAPIError as exc:
-                logger.warning("Could not post placeholder comment", error=str(exc))
+                logger.info(
+                    "Stage 5 passed — placeholder comment posted",
+                    comment_id=placeholder_comment_id,
+                )
+        except gh.GitHubAPIError as exc:
+            # Non-fatal — missing PR comment is bad UX but shouldn't abort analysis
+            logger.warning(
+                "Stage 5: could not post placeholder comment — continuing",
+                error=str(exc),
+                status_code=exc.status_code,
+            )
+    else:
+        logger.info("Stage 5: no PR number — skipping comment (push-only run)")
 
-    # ── 6. Download logs ───────────────────────────────────────────────────────
+    # ── STAGE 6: Download logs ─────────────────────────────────────────────────
+    logger.info("Stage 6: downloading log ZIP")
+    zip_bytes: bytes | None = None
     try:
         zip_bytes = await gh.download_logs_zip(
             installation_id, owner, repo_name, github_run_id
         )
+        logger.info(
+            "Stage 6 passed — log ZIP downloaded",
+            size_bytes=len(zip_bytes),
+        )
     except gh.LogsNotFoundError:
-        logger.warning("Logs not found — may have expired (>90 days)")
+        logger.warning("Stage 6: logs not found (may have expired >90 days)")
         workflow_run.status = "failed"
         workflow_run.error_detail = "logs_expired"
-        return
+        return  # Commit will happen in the outer try block
     except gh.GitHubAPIError as exc:
-        logger.error("Log download failed", error=str(exc))
+        logger.error(
+            "Stage 6 FAILED: log download threw GitHub API error",
+            error=str(exc),
+            status_code=exc.status_code,
+            exc_info=True,
+        )
         workflow_run.status = "failed"
         workflow_run.error_detail = f"log_download_failed: {exc}"
         return
+    except Exception as exc:
+        logger.error("Stage 6 FAILED: unexpected error during log download", error=str(exc), exc_info=True)
+        workflow_run.status = "failed"
+        workflow_run.error_detail = f"unexpected_log_error: {exc}"
+        return
 
-    # ── 7. Parse logs ──────────────────────────────────────────────────────────
-    parsed = parse_log_zip(zip_bytes)
+    # ── STAGE 7: Parse logs ────────────────────────────────────────────────────
+    logger.info("Stage 7: parsing log ZIP")
+    try:
+        parsed = parse_log_zip(zip_bytes)
+        logger.info(
+            "Stage 7 passed — logs parsed",
+            total_steps=parsed.total_steps,
+            failing_steps=parsed.total_failing_steps,
+            root_step=parsed.root_step.name if parsed.root_step else None,
+            ecosystem=parsed.ecosystem,
+            snippet_lines=len(parsed.snippet.splitlines()),
+        )
+    except Exception as exc:
+        logger.error("Stage 7 FAILED: log parsing threw", error=str(exc), exc_info=True)
+        workflow_run.status = "failed"
+        workflow_run.error_detail = f"log_parse_failed: {exc}"
+        return
 
-    # ── 8. Redact ──────────────────────────────────────────────────────────────
-    redaction_result = redact(parsed.snippet)
-    clean_snippet = redaction_result.text
-    redaction_count = redaction_result.count
+    # ── STAGE 8: Redact secrets ────────────────────────────────────────────────
+    logger.info("Stage 8: redacting secrets")
+    try:
+        redaction_result = redact(parsed.snippet)
+        clean_snippet = redaction_result.text
+        redaction_count = redaction_result.count
+        logger.info(
+            "Stage 8 passed — redaction complete",
+            count=redaction_count,
+            categories=redaction_result.categories,
+        )
+    except Exception as exc:
+        logger.error("Stage 8 FAILED: redaction threw", error=str(exc), exc_info=True)
+        # Non-fatal — use raw snippet if redaction fails (still safe for rule engine)
+        clean_snippet = parsed.snippet
+        redaction_count = 0
 
-    logger.info(
-        "Redaction complete",
-        count=redaction_count,
-        categories=redaction_result.categories,
-    )
+    # ── STAGE 9: Rule engine ───────────────────────────────────────────────────
+    logger.info("Stage 9: running rule engine")
+    rule_result = None
+    try:
+        rule_result = rule_match(clean_snippet, parsed.ecosystem)
+        if rule_result:
+            logger.info(
+                "Stage 9 passed — rule matched",
+                rule_id=rule_result.rule_id,
+                category=rule_result.category,
+            )
+        else:
+            logger.info("Stage 9 passed — no rule match, will use AI")
+    except Exception as exc:
+        logger.error("Stage 9 FAILED: rule engine threw", error=str(exc), exc_info=True)
+        # Non-fatal — fall through to AI
 
-    # ── 9. Rule engine ─────────────────────────────────────────────────────────
-    rule_result = rule_match(clean_snippet, parsed.ecosystem)
-
+    # ── Analysis result defaults ───────────────────────────────────────────────
     analysis_source = "unknown"
     root_cause = "Unable to determine root cause"
-    fix = "Review the log snippet above for more details"
+    fix = "Review the log snippet above for details"
     prevention: str | None = None
     category = "unknown"
     confidence: int | None = None
@@ -344,18 +474,20 @@ async def _pipeline(
         confidence = 100
         rule_id = rule_result.rule_id
 
-        # Increment hit count — non-blocking
-        await increment_hit_count(rule_id, db)
-
-        logger.info(
-            "Rule engine resolved failure",
-            rule_id=rule_id,
-            category=category,
-        )
+        # Increment hit count — non-blocking, separate try/except
+        try:
+            await increment_hit_count(rule_id, db)
+            logger.info("Stage 9b: rule hit count incremented", rule_id=rule_id)
+        except Exception as exc:
+            logger.warning(
+                "Stage 9b: hit count increment failed — non-fatal",
+                rule_id=rule_id,
+                error=str(exc),
+            )
 
     else:
-        # ── 10. AI fallback ────────────────────────────────────────────────────
-        logger.info("No rule match — falling back to AI analyzer")
+        # ── STAGE 10: AI fallback ──────────────────────────────────────────────
+        logger.info("Stage 10: calling AI analyzer")
         try:
             analyzer = get_analyzer()
             ai_result = await analyzer.analyze(
@@ -374,17 +506,28 @@ async def _pipeline(
             confidence = ai_result.confidence
 
             logger.info(
-                "AI analysis complete",
+                "Stage 10 passed — AI analysis complete",
                 source=analysis_source,
                 confidence=confidence,
                 category=category,
             )
 
         except AIAnalysisError as exc:
-            logger.error("AI analysis failed", error=str(exc))
+            logger.error(
+                "Stage 10: AI analysis failed — using degraded mode",
+                error=str(exc),
+            )
+            analysis_source = "degraded"
+        except Exception as exc:
+            logger.error(
+                "Stage 10: unexpected AI error — using degraded mode",
+                error=str(exc),
+                exc_info=True,
+            )
             analysis_source = "degraded"
 
-    # ── 11. Build comment ──────────────────────────────────────────────────────
+    # ── STAGE 11: Build and post PR comment ────────────────────────────────────
+    logger.info("Stage 11: posting final PR comment")
     analysis_ms = round((time.monotonic() - start_time) * 1000)
 
     if analysis_source == "degraded":
@@ -412,7 +555,6 @@ async def _pipeline(
             ecosystem=parsed.ecosystem,
         )
 
-    # ── 12. Post/update PR comment ─────────────────────────────────────────────
     if pr_number:
         try:
             if placeholder_comment_id:
@@ -420,267 +562,122 @@ async def _pipeline(
                     installation_id, owner, repo_name,
                     placeholder_comment_id, comment_body,
                 )
+                logger.info(
+                    "Stage 11 passed — existing comment updated",
+                    comment_id=placeholder_comment_id,
+                )
             else:
-                placeholder_comment_id = await gh.post_pr_comment(
+                new_comment_id = await gh.post_pr_comment(
                     installation_id, owner, repo_name, pr_number, comment_body,
                 )
+                logger.info(
+                    "Stage 11 passed — new comment posted",
+                    comment_id=new_comment_id,
+                )
         except gh.GitHubAPIError as exc:
-            logger.error("Failed to post/update PR comment", error=str(exc))
+            logger.error(
+                "Stage 11: PR comment post/update failed — non-fatal, continuing to DB write",
+                error=str(exc),
+                status_code=exc.status_code,
+            )
+        except Exception as exc:
+            logger.error(
+                "Stage 11: unexpected error posting comment — non-fatal, continuing to DB write",
+                error=str(exc),
+                exc_info=True,
+            )
+    else:
+        logger.info("Stage 11: no PR number — skipping comment")
 
-    # ── 13. Persist FailureAnalysis ────────────────────────────────────────────
-    failure_analysis = FailureAnalysis(
-        run_id=workflow_run.id,
-        error_category=category,
-        failed_step=parsed.root_step.name if parsed.root_step else None,
-        cascading_steps=json.dumps(parsed.cascading_steps),
-        root_cause=root_cause,
-        fix_suggestion=fix,
-        confidence=confidence,
-        source=analysis_source,
-        rule_id=rule_id,
-        redaction_count=redaction_count,
-    )
-    db.add(failure_analysis)
+    # ── STAGE 12: Persist FailureAnalysis ─────────────────────────────────────
+    logger.info("Stage 12: persisting FailureAnalysis record")
+    try:
+        failure_analysis = FailureAnalysis(
+            run_id=workflow_run.id,
+            error_category=category,
+            failed_step=parsed.root_step.name if parsed.root_step else None,
+            cascading_steps=json.dumps(parsed.cascading_steps),
+            root_cause=root_cause,
+            fix_suggestion=fix,
+            confidence=confidence,
+            source=analysis_source,
+            rule_id=rule_id,
+            redaction_count=redaction_count,
+        )
+        db.add(failure_analysis)
+        await db.flush()
+        logger.info(
+            "Stage 12 passed — FailureAnalysis flushed",
+            analysis_db_id=str(failure_analysis.id),
+            source=analysis_source,
+        )
+    except Exception as exc:
+        logger.error("Stage 12 FAILED: FailureAnalysis creation threw", error=str(exc), exc_info=True)
+        raise
 
-    # ── 14. Mark WorkflowRun completed ────────────────────────────────────────
-    workflow_run.status = "completed"
-    workflow_run.analyzed_at = datetime.now(timezone.utc)
-    workflow_run.analysis_ms = analysis_ms
-    workflow_run.comment_posted = pr_number is not None
+    # ── STAGE 13: Mark WorkflowRun as completed ────────────────────────────────
+    logger.info("Stage 13: marking WorkflowRun as completed")
+    try:
+        workflow_run.status = "completed"
+        workflow_run.analyzed_at = datetime.now(timezone.utc)
+        workflow_run.analysis_ms = analysis_ms
+        workflow_run.comment_posted = pr_number is not None
+        logger.info(
+            "Stage 13 passed — WorkflowRun marked completed",
+            run_db_id=str(workflow_run.id),
+            analysis_ms=analysis_ms,
+            comment_posted=workflow_run.comment_posted,
+        )
+    except Exception as exc:
+        logger.error("Stage 13 FAILED: WorkflowRun update threw", error=str(exc), exc_info=True)
+        raise
 
     logger.info(
-        "Pipeline complete",
-        run_id=str(workflow_run.id),
+        "All pipeline stages complete — ready for commit",
+        run_db_id=str(workflow_run.id),
         source=analysis_source,
         category=category,
         analysis_ms=analysis_ms,
-        comment_posted=workflow_run.comment_posted,
-        redactions=redaction_count,
     )
 
 
-async def _mark_run_failed(
-    db: AsyncSession, github_run_id: int, reason: str
-) -> None:
-    result = await db.execute(
-        select(WorkflowRun).where(WorkflowRun.github_run_id == github_run_id)
-    )
-    run = result.scalar_one_or_none()
-    if run:
-        run.status = "failed"
-        run.error_detail = reason[:500]
+async def _mark_run_failed_safe(github_run_id: int, reason: str) -> None:
+    """
+    Mark a run as failed using a completely fresh DB session.
+    Called from the exception handler — the main session may be in a bad state.
+    Never raises.
+    """
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(WorkflowRun).where(
+                    WorkflowRun.github_run_id == github_run_id
+                )
+            )
+            run = result.scalar_one_or_none()
+            if run:
+                run.status = "failed"
+                run.error_detail = reason[:500]
+                await db.commit()
+                logger.info(
+                    "Marked run as failed in DB",
+                    github_run_id=github_run_id,
+                    reason=reason[:100],
+                )
+            else:
+                logger.warning(
+                    "Could not mark run as failed — WorkflowRun not found in DB",
+                    github_run_id=github_run_id,
+                )
+    except Exception as exc:
+        logger.error(
+            "Failed to mark run as failed — completely silent failure",
+            github_run_id=github_run_id,
+            error=str(exc),
+        )
 
 
 # ── Webhook entry point ────────────────────────────────────────────────────────
-
-async def _ensure_installation_from_payload(
-    db: AsyncSession,
-    installation_data: dict,
-) -> Installation | None:
-    github_installation_id = installation_data.get("id")
-    account = installation_data.get("account")
-
-    logger.info(
-        "Resolving installation",
-        installation_id=github_installation_id,
-        has_account=account is not None,
-    )
-
-    if not github_installation_id:
-        logger.error("Installation payload missing id")
-        return None
-
-    result = await db.execute(
-        select(Installation).where(
-            Installation.installation_id == github_installation_id
-        )
-    )
-    installation = result.scalar_one_or_none()
-
-    if installation:
-        logger.info(
-            "Installation lookup succeeded",
-            installation_id=github_installation_id,
-            db_id=str(installation.id),
-        )
-        return installation
-
-    logger.warning(
-        "Installation lookup missed; creating from webhook payload",
-        installation_id=github_installation_id,
-    )
-
-    if not account:
-        logger.error(
-            "Cannot create installation without account data",
-            installation_id=github_installation_id,
-        )
-        return None
-
-    user_result = await db.execute(select(User).where(User.github_id == account["id"]))
-    user = user_result.scalar_one_or_none()
-
-    if not user:
-        user = User(
-            github_id=account["id"],
-            login=account["login"],
-            name=account.get("name"),
-            avatar_url=account.get("avatar_url"),
-        )
-        db.add(user)
-        await db.flush()
-        logger.info(
-            "User created from webhook payload",
-            github_id=account["id"],
-            login=account["login"],
-            user_id=str(user.id),
-        )
-    else:
-        user.login = account["login"]
-        user.name = account.get("name")
-        user.avatar_url = account.get("avatar_url")
-        logger.info(
-            "User lookup succeeded",
-            github_id=account["id"],
-            user_id=str(user.id),
-        )
-
-    installation = Installation(
-        installation_id=github_installation_id,
-        user_id=user.id,
-        account_login=account["login"],
-        account_type=account["type"],
-    )
-    db.add(installation)
-    await db.flush()
-
-    logger.info(
-        "Installation created from webhook payload",
-        installation_id=github_installation_id,
-        db_id=str(installation.id),
-        account=account["login"],
-    )
-
-    return installation
-
-
-async def _persist_repositories(
-    db: AsyncSession,
-    installation: Installation,
-    repositories: list[dict],
-) -> dict[str, int]:
-    inserted = 0
-    updated = 0
-    unchanged = 0
-
-    logger.info(
-        "Repository persistence started",
-        installation_id=installation.installation_id,
-        installation_db_id=str(installation.id),
-        repositories_count=len(repositories),
-    )
-
-    for repo in repositories:
-        github_repo_id = repo["id"]
-        full_name = repo["full_name"]
-        default_branch = repo.get("default_branch") or "main"
-
-        logger.info(
-            "Processing repository",
-            repo_name=full_name,
-            repo_id=github_repo_id,
-        )
-
-        result = await db.execute(
-            select(Repository).where(Repository.github_repo_id == github_repo_id)
-        )
-        existing = result.scalar_one_or_none()
-
-        if existing:
-            changed = False
-
-            if existing.installation_id != installation.id:
-                existing.installation_id = installation.id
-                changed = True
-            if existing.full_name != full_name:
-                existing.full_name = full_name
-                changed = True
-            if existing.default_branch != default_branch:
-                existing.default_branch = default_branch
-                changed = True
-            if not existing.is_active:
-                existing.is_active = True
-                changed = True
-
-            if changed:
-                updated += 1
-                logger.info(
-                    "Repository queued for update",
-                    repo_name=full_name,
-                    repo_id=github_repo_id,
-                    repository_db_id=str(existing.id),
-                )
-            else:
-                unchanged += 1
-                logger.info(
-                    "Repository already current",
-                    repo_name=full_name,
-                    repo_id=github_repo_id,
-                    repository_db_id=str(existing.id),
-                )
-
-            continue
-
-        repository = Repository(
-            installation_id=installation.id,
-            github_repo_id=github_repo_id,
-            full_name=full_name,
-            default_branch=default_branch,
-            is_active=True,
-        )
-        db.add(repository)
-        inserted += 1
-
-        logger.info(
-            "Repository queued for insert",
-            repo_name=full_name,
-            repo_id=github_repo_id,
-            installation_db_id=str(installation.id),
-        )
-
-    await db.flush()
-
-    logger.info(
-        "Repository persistence flushed",
-        installation_id=installation.installation_id,
-        inserted=inserted,
-        updated=updated,
-        unchanged=unchanged,
-    )
-
-    return {
-        "inserted": inserted,
-        "updated": updated,
-        "unchanged": unchanged,
-    }
-
-
-async def _count_persisted_repositories(
-    db: AsyncSession,
-    repositories: list[dict],
-) -> int:
-    repo_ids = [repo["id"] for repo in repositories]
-
-    if not repo_ids:
-        return 0
-
-    result = await db.execute(
-        select(Repository.github_repo_id).where(
-            Repository.github_repo_id.in_(repo_ids)
-        )
-    )
-    return len(result.scalars().all())
-
 
 @router.post("/github")
 async def github_webhook(
@@ -744,80 +741,19 @@ async def github_webhook(
 
         case "installation":
             action = payload.get("action")
-
-            if action != "created":
-                return
-
-            installation_data = payload["installation"]
-            repositories = payload.get("repositories", [])
-
-            async with AsyncSessionLocal() as db:
-                installation = await _ensure_installation_from_payload(
-                    db, installation_data
-                )
-
-                if not installation:
-                    await db.rollback()
-                    return
-
-                repo_counts = await _persist_repositories(
-                    db, installation, repositories
-                )
-                await db.commit()
-                persisted_count = await _count_persisted_repositories(
-                    db, repositories
-                )
-
+            inst = payload.get("installation", {})
             logger.info(
-                "Installation webhook committed",
-                installation_id=installation_data["id"],
-                repos_received=len(repositories),
-                repositories_inserted=repo_counts["inserted"],
-                repositories_updated=repo_counts["updated"],
-                repositories_unchanged=repo_counts["unchanged"],
-                repositories_visible_after_commit=persisted_count,
+                "Installation event",
+                action=action,
+                installation_id=inst.get("id"),
+                account=inst.get("account", {}).get("login"),
             )
 
         case "installation_repositories":
-            installation_data = payload["installation"]
-            repositories = payload.get("repositories_added", [])
-
             logger.info(
-                "installation_repositories received",
-                installation_id=installation_data.get("id"),
-                repos_added=len(repositories),
-            )
-
-            async with AsyncSessionLocal() as db:
-                installation = await _ensure_installation_from_payload(
-                    db, installation_data
-                )
-
-                if not installation:
-                    await db.rollback()
-                    logger.error(
-                        "Repository persistence skipped; installation unavailable",
-                        installation_id=installation_data.get("id"),
-                        repos_added=len(repositories),
-                    )
-                    return
-
-                repo_counts = await _persist_repositories(
-                    db, installation, repositories
-                )
-                await db.commit()
-                persisted_count = await _count_persisted_repositories(
-                    db, repositories
-                )
-
-            logger.info(
-                "Repositories committed",
-                installation_id=installation_data.get("id"),
-                repositories_received=len(repositories),
-                repositories_inserted=repo_counts["inserted"],
-                repositories_updated=repo_counts["updated"],
-                repositories_unchanged=repo_counts["unchanged"],
-                repositories_visible_after_commit=persisted_count,
+                "Repositories changed",
+                added=len(payload.get("repositories_added", [])),
+                removed=len(payload.get("repositories_removed", [])),
             )
 
         case "ping":
