@@ -17,10 +17,6 @@ Flow per failed workflow_run:
     j.  Persist FailureAnalysis
     k.  Mark WorkflowRun status=completed
 """
-from sqlalchemy import select
-
-from db import AsyncSessionLocal
-from models.database import User, Installation, Repository
 import hashlib
 import hmac
 import json
@@ -28,13 +24,13 @@ import time
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import get_settings
 from db import AsyncSessionLocal
 from logger import logger
-from models.database import Installation, Repository, WorkflowRun, FailureAnalysis
+from models.database import FailureAnalysis, Installation, Repository, User, WorkflowRun
 from services import github as gh
 from services.log_parser import parse_log_zip
 from services.redactor import redact
@@ -477,6 +473,215 @@ async def _mark_run_failed(
 
 # ── Webhook entry point ────────────────────────────────────────────────────────
 
+async def _ensure_installation_from_payload(
+    db: AsyncSession,
+    installation_data: dict,
+) -> Installation | None:
+    github_installation_id = installation_data.get("id")
+    account = installation_data.get("account")
+
+    logger.info(
+        "Resolving installation",
+        installation_id=github_installation_id,
+        has_account=account is not None,
+    )
+
+    if not github_installation_id:
+        logger.error("Installation payload missing id")
+        return None
+
+    result = await db.execute(
+        select(Installation).where(
+            Installation.installation_id == github_installation_id
+        )
+    )
+    installation = result.scalar_one_or_none()
+
+    if installation:
+        logger.info(
+            "Installation lookup succeeded",
+            installation_id=github_installation_id,
+            db_id=str(installation.id),
+        )
+        return installation
+
+    logger.warning(
+        "Installation lookup missed; creating from webhook payload",
+        installation_id=github_installation_id,
+    )
+
+    if not account:
+        logger.error(
+            "Cannot create installation without account data",
+            installation_id=github_installation_id,
+        )
+        return None
+
+    user_result = await db.execute(select(User).where(User.github_id == account["id"]))
+    user = user_result.scalar_one_or_none()
+
+    if not user:
+        user = User(
+            github_id=account["id"],
+            login=account["login"],
+            name=account.get("name"),
+            avatar_url=account.get("avatar_url"),
+        )
+        db.add(user)
+        await db.flush()
+        logger.info(
+            "User created from webhook payload",
+            github_id=account["id"],
+            login=account["login"],
+            user_id=str(user.id),
+        )
+    else:
+        user.login = account["login"]
+        user.name = account.get("name")
+        user.avatar_url = account.get("avatar_url")
+        logger.info(
+            "User lookup succeeded",
+            github_id=account["id"],
+            user_id=str(user.id),
+        )
+
+    installation = Installation(
+        installation_id=github_installation_id,
+        user_id=user.id,
+        account_login=account["login"],
+        account_type=account["type"],
+    )
+    db.add(installation)
+    await db.flush()
+
+    logger.info(
+        "Installation created from webhook payload",
+        installation_id=github_installation_id,
+        db_id=str(installation.id),
+        account=account["login"],
+    )
+
+    return installation
+
+
+async def _persist_repositories(
+    db: AsyncSession,
+    installation: Installation,
+    repositories: list[dict],
+) -> dict[str, int]:
+    inserted = 0
+    updated = 0
+    unchanged = 0
+
+    logger.info(
+        "Repository persistence started",
+        installation_id=installation.installation_id,
+        installation_db_id=str(installation.id),
+        repositories_count=len(repositories),
+    )
+
+    for repo in repositories:
+        github_repo_id = repo["id"]
+        full_name = repo["full_name"]
+        default_branch = repo.get("default_branch") or "main"
+
+        logger.info(
+            "Processing repository",
+            repo_name=full_name,
+            repo_id=github_repo_id,
+        )
+
+        result = await db.execute(
+            select(Repository).where(Repository.github_repo_id == github_repo_id)
+        )
+        existing = result.scalar_one_or_none()
+
+        if existing:
+            changed = False
+
+            if existing.installation_id != installation.id:
+                existing.installation_id = installation.id
+                changed = True
+            if existing.full_name != full_name:
+                existing.full_name = full_name
+                changed = True
+            if existing.default_branch != default_branch:
+                existing.default_branch = default_branch
+                changed = True
+            if not existing.is_active:
+                existing.is_active = True
+                changed = True
+
+            if changed:
+                updated += 1
+                logger.info(
+                    "Repository queued for update",
+                    repo_name=full_name,
+                    repo_id=github_repo_id,
+                    repository_db_id=str(existing.id),
+                )
+            else:
+                unchanged += 1
+                logger.info(
+                    "Repository already current",
+                    repo_name=full_name,
+                    repo_id=github_repo_id,
+                    repository_db_id=str(existing.id),
+                )
+
+            continue
+
+        repository = Repository(
+            installation_id=installation.id,
+            github_repo_id=github_repo_id,
+            full_name=full_name,
+            default_branch=default_branch,
+            is_active=True,
+        )
+        db.add(repository)
+        inserted += 1
+
+        logger.info(
+            "Repository queued for insert",
+            repo_name=full_name,
+            repo_id=github_repo_id,
+            installation_db_id=str(installation.id),
+        )
+
+    await db.flush()
+
+    logger.info(
+        "Repository persistence flushed",
+        installation_id=installation.installation_id,
+        inserted=inserted,
+        updated=updated,
+        unchanged=unchanged,
+    )
+
+    return {
+        "inserted": inserted,
+        "updated": updated,
+        "unchanged": unchanged,
+    }
+
+
+async def _count_persisted_repositories(
+    db: AsyncSession,
+    repositories: list[dict],
+) -> int:
+    repo_ids = [repo["id"] for repo in repositories]
+
+    if not repo_ids:
+        return 0
+
+    result = await db.execute(
+        select(Repository.github_repo_id).where(
+            Repository.github_repo_id.in_(repo_ids)
+        )
+    )
+    return len(result.scalars().all())
+
+
 @router.post("/github")
 async def github_webhook(
     request: Request,
@@ -544,129 +749,75 @@ async def github_webhook(
                 return
 
             installation_data = payload["installation"]
-            account = payload["installation"]["account"]
+            repositories = payload.get("repositories", [])
 
             async with AsyncSessionLocal() as db:
-
-                result = await db.execute(
-                    select(User).where(User.github_id == account["id"])
+                installation = await _ensure_installation_from_payload(
+                    db, installation_data
                 )
 
-                user = result.scalar_one_or_none()
+                if not installation:
+                    await db.rollback()
+                    return
 
-                if not user:
-                    user = User(
-                        github_id=account["id"],
-                        login=account["login"],
-                        name=account.get("name"),
-                        avatar_url=account.get("avatar_url"),
-                    )
-
-                    db.add(user)
-                    await db.flush()
-
-                result = await db.execute(
-                    select(Installation).where(
-                        Installation.installation_id == installation_data["id"]
-                    )
+                repo_counts = await _persist_repositories(
+                    db, installation, repositories
                 )
-
-                existing_installation = result.scalar_one_or_none()
-
-                if not existing_installation:
-                    db.add(
-                        Installation(
-                            installation_id=installation_data["id"],
-                            user_id=user.id,
-                            account_login=account["login"],
-                            account_type=account["type"],
-                        )
-                    )
-
                 await db.commit()
+                persisted_count = await _count_persisted_repositories(
+                    db, repositories
+                )
 
             logger.info(
-                "Installation saved",
+                "Installation webhook committed",
                 installation_id=installation_data["id"],
-                account=account["login"],
+                repos_received=len(repositories),
+                repositories_inserted=repo_counts["inserted"],
+                repositories_updated=repo_counts["updated"],
+                repositories_unchanged=repo_counts["unchanged"],
+                repositories_visible_after_commit=persisted_count,
             )
 
         case "installation_repositories":
             installation_data = payload["installation"]
+            repositories = payload.get("repositories_added", [])
 
             logger.info(
                 "installation_repositories received",
-                installation_id=installation_data["id"],
-                repos_added=len(payload.get("repositories_added", [])),
+                installation_id=installation_data.get("id"),
+                repos_added=len(repositories),
             )
 
             async with AsyncSessionLocal() as db:
-
-                result = await db.execute(
-                    select(Installation).where(
-                        Installation.installation_id == installation_data["id"]
-                    )
+                installation = await _ensure_installation_from_payload(
+                    db, installation_data
                 )
 
-                installation = result.scalar_one_or_none()
-
                 if not installation:
+                    await db.rollback()
                     logger.error(
-                        "Installation not found",
-                        installation_id=installation_data["id"],
+                        "Repository persistence skipped; installation unavailable",
+                        installation_id=installation_data.get("id"),
+                        repos_added=len(repositories),
                     )
                     return
 
-                logger.info(
-                    "Installation found",
-                    installation_id=installation.installation_id,
-                    db_id=str(installation.id),
+                repo_counts = await _persist_repositories(
+                    db, installation, repositories
+                )
+                await db.commit()
+                persisted_count = await _count_persisted_repositories(
+                    db, repositories
                 )
 
-                for repo in payload.get("repositories_added", []):
-
-                    logger.info(
-                        "Processing repository",
-                        repo_name=repo["full_name"],
-                        repo_id=repo["id"],
-                    )
-
-                    existing = await db.execute(
-                        select(Repository).where(
-                            Repository.github_repo_id == repo["id"]
-                        )
-                    )
-
-                    if existing.scalar_one_or_none():
-                        logger.info(
-                            "Repository already exists",
-                            repo_id=repo["id"],
-                        )
-                        continue
-
-                    db.add(
-                        Repository(
-                            installation_id=installation.id,
-                            github_repo_id=repo["id"],
-                            full_name=repo["full_name"],
-                            default_branch=repo.get(
-                                "default_branch",
-                                "main",
-                            ),
-                            is_active=True,
-                        )
-                    )
-
-                    logger.info(
-                        "Repository queued for insert",
-                        repo_name=repo["full_name"],
-                    )
-
-                await db.commit()
-
             logger.info(
-                "Repositories saved",
-                count=len(payload.get("repositories_added", [])),
+                "Repositories committed",
+                installation_id=installation_data.get("id"),
+                repositories_received=len(repositories),
+                repositories_inserted=repo_counts["inserted"],
+                repositories_updated=repo_counts["updated"],
+                repositories_unchanged=repo_counts["unchanged"],
+                repositories_visible_after_commit=persisted_count,
             )
 
         case "ping":
