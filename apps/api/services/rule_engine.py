@@ -10,6 +10,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from logger import logger
 
@@ -29,6 +30,71 @@ class RuleMatch:
 _patterns_cache: list[dict] | None = None
 
 
+def _preview(value: Any) -> str:
+    return repr(value)[:500]
+
+
+def _log_before_get(context: str, value: Any) -> None:
+    logger.info(
+        "Before .get()",
+        context=context,
+        object_type=type(value).__name__,
+        object_preview=_preview(value),
+    )
+
+
+def _safe_get(value: Any, key: str, default: Any = None, *, context: str) -> Any:
+    _log_before_get(context, value)
+
+    if not isinstance(value, dict):
+        logger.warning(
+            "Expected dict before .get(); using default",
+            context=context,
+            key=key,
+            object_type=type(value).__name__,
+            object_preview=_preview(value),
+        )
+        return default
+
+    return value.get(key, default)
+
+
+def _normalize_patterns(raw_patterns: Any) -> list[dict]:
+    logger.info(
+        "Rule patterns loaded from JSON",
+        object_type=type(raw_patterns).__name__,
+        object_preview=_preview(raw_patterns),
+    )
+
+    normalized: list[dict] = []
+
+    def add_patterns(value: Any, path: str) -> None:
+        if isinstance(value, dict):
+            normalized.append(value)
+            return
+
+        if isinstance(value, list):
+            logger.warning(
+                "Rule pattern list encountered; flattening",
+                path=path,
+                object_type=type(value).__name__,
+                object_preview=_preview(value),
+            )
+            for index, item in enumerate(value):
+                add_patterns(item, f"{path}[{index}]")
+            return
+
+        logger.warning(
+            "Ignoring invalid rule pattern entry",
+            path=path,
+            object_type=type(value).__name__,
+            object_preview=_preview(value),
+        )
+
+    add_patterns(raw_patterns, "patterns")
+    return normalized
+
+
 def _load_patterns() -> list[dict]:
     global _patterns_cache
     if _patterns_cache is not None:
@@ -46,7 +112,7 @@ def _load_patterns() -> list[dict]:
         return _patterns_cache
 
     with candidate.open() as f:
-        _patterns_cache = json.load(f)
+        _patterns_cache = _normalize_patterns(json.load(f))
 
     logger.info("Rule engine loaded", pattern_count=len(_patterns_cache))
     return _patterns_cache
@@ -59,12 +125,21 @@ def match(log_snippet: str, ecosystem: str = "unknown") -> RuleMatch | None:
     """
     patterns = _load_patterns()
 
-    for rule in patterns:
-        if not rule.get("is_active", True):
+    for rule_index, rule in enumerate(patterns):
+        if not isinstance(rule, dict):
+            logger.warning(
+                "Skipping non-dict rule pattern",
+                rule_index=rule_index,
+                object_type=type(rule).__name__,
+                object_preview=_preview(rule),
+            )
             continue
 
-        rule_category = rule.get("category", "")
-        if rule.get("strict_ecosystem", False):
+        if not _safe_get(rule, "is_active", True, context="rule.is_active"):
+            continue
+
+        rule_category = _safe_get(rule, "category", "", context="rule.category")
+        if _safe_get(rule, "strict_ecosystem", False, context="rule.strict_ecosystem"):
             if rule_category not in ("", "unknown", ecosystem) and ecosystem != "unknown":
                 continue
 
@@ -73,7 +148,7 @@ def match(log_snippet: str, ecosystem: str = "unknown") -> RuleMatch | None:
         except re.error as exc:
             logger.warning(
                 "Invalid regex in patterns.json — skipping",
-                rule_id=rule.get("id"),
+                rule_id=_safe_get(rule, "id", context="rule.id.invalid_regex"),
                 error=str(exc),
             )
             continue
@@ -82,18 +157,26 @@ def match(log_snippet: str, ecosystem: str = "unknown") -> RuleMatch | None:
         if match_obj:
             logger.info(
                 "Rule engine matched",
-                rule_id=rule.get("id"),
+                rule_id=_safe_get(rule, "id", context="rule.id.match_log"),
                 category=rule_category,
-                severity=rule.get("severity"),
+                severity=_safe_get(rule, "severity", context="rule.severity.match_log"),
             )
             return RuleMatch(
-                rule_id=rule.get("id", "unknown"),
+                rule_id=_safe_get(rule, "id", "unknown", context="rule.id.result"),
                 category=rule_category,
-                severity=rule.get("severity", "medium"),
-                root_cause=_interpolate(rule.get("root_cause", ""), match_obj),
-                fix=_interpolate(rule.get("fix", ""), match_obj),
-                fix_url=rule.get("fix_url"),
-                prevention=rule.get("prevention"),
+                severity=_safe_get(
+                    rule, "severity", "medium", context="rule.severity.result"
+                ),
+                root_cause=_interpolate(
+                    _safe_get(rule, "root_cause", "", context="rule.root_cause"),
+                    match_obj,
+                ),
+                fix=_interpolate(
+                    _safe_get(rule, "fix", "", context="rule.fix"),
+                    match_obj,
+                ),
+                fix_url=_safe_get(rule, "fix_url", context="rule.fix_url"),
+                prevention=_safe_get(rule, "prevention", context="rule.prevention"),
             )
 
     return None
@@ -124,17 +207,34 @@ async def increment_hit_count(rule_id: str, db) -> None:
         else:
             # First time this rule has fired — seed from patterns.json
             patterns = _load_patterns()
-            rule_data = next((p for p in patterns if p.get("id") == rule_id), None)
+            rule_data = next(
+                (
+                    p
+                    for p in patterns
+                    if _safe_get(p, "id", context="rule_data.id.lookup") == rule_id
+                ),
+                None,
+            )
 
             if rule_data:
                 new_pattern = ErrorPattern(
                     pattern_id=rule_id,
-                    pattern=rule_data.get("pattern", ""),
-                    category=rule_data.get("category", "unknown"),
-                    severity=rule_data.get("severity", "medium"),
-                    root_cause=rule_data.get("root_cause", ""),
-                    fix=rule_data.get("fix", ""),
-                    fix_url=rule_data.get("fix_url"),
+                    pattern=_safe_get(
+                        rule_data, "pattern", "", context="rule_data.pattern"
+                    ),
+                    category=_safe_get(
+                        rule_data, "category", "unknown", context="rule_data.category"
+                    ),
+                    severity=_safe_get(
+                        rule_data, "severity", "medium", context="rule_data.severity"
+                    ),
+                    root_cause=_safe_get(
+                        rule_data, "root_cause", "", context="rule_data.root_cause"
+                    ),
+                    fix=_safe_get(rule_data, "fix", "", context="rule_data.fix"),
+                    fix_url=_safe_get(
+                        rule_data, "fix_url", context="rule_data.fix_url"
+                    ),
                     hit_count=1,
                     is_active=True,
                 )

@@ -13,6 +13,7 @@ Never receives raw logs. Only receives:
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Any
 
 import google.generativeai as genai
 from pydantic import BaseModel, field_validator
@@ -24,6 +25,66 @@ from logger import logger
 # ── Response schema ───────────────────────────────────────────────────────────
 
 VALID_CATEGORIES = {"node", "docker", "python", "testing", "permissions", "secrets", "other"}
+
+
+def _preview(value: Any) -> str:
+    return repr(value)[:500]
+
+
+def _log_before_get(context: str, value: Any) -> None:
+    logger.info(
+        "Before .get()",
+        context=context,
+        object_type=type(value).__name__,
+        object_preview=_preview(value),
+    )
+
+
+def _safe_get(value: Any, key: str, default: Any = None, *, context: str) -> Any:
+    _log_before_get(context, value)
+
+    if not isinstance(value, dict):
+        logger.warning(
+            "Expected dict before .get(); using default",
+            context=context,
+            key=key,
+            object_type=type(value).__name__,
+            object_preview=_preview(value),
+        )
+        return default
+
+    return value.get(key, default)
+
+
+def _normalize_analysis_payload(value: Any, *, context: str) -> dict:
+    logger.info(
+        "Normalizing AI analysis payload",
+        context=context,
+        object_type=type(value).__name__,
+        object_preview=_preview(value),
+    )
+
+    if isinstance(value, dict):
+        return value
+
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            if isinstance(item, dict):
+                logger.warning(
+                    "AI analysis payload was a list; using first dict item",
+                    context=context,
+                    selected_index=index,
+                    object_preview=_preview(item),
+                )
+                return item
+
+        raise AIAnalysisError(
+            f"{context} returned a list without a JSON object: {_preview(value)}"
+        )
+
+    raise AIAnalysisError(
+        f"{context} returned {type(value).__name__}, expected dict: {_preview(value)}"
+    )
 
 
 class AIAnalysis(BaseModel):
@@ -128,7 +189,10 @@ class GeminiAnalyzer(AIAnalyzer):
                     raw = re.sub(r"^```(?:json)?\n?", "", raw)
                     raw = re.sub(r"\n?```$", "", raw)
 
-                data = json.loads(raw)
+                data = _normalize_analysis_payload(
+                    json.loads(raw),
+                    context="gemini_response",
+                )
                 analysis = AIAnalysis(**data)
 
                 logger.info(
@@ -191,8 +255,12 @@ class OllamaAnalyzer(AIAnalyzer):
         if response.status_code != 200:
             raise AIAnalysisError(f"Ollama returned {response.status_code}")
 
-        raw = response.json().get("response", "")
-        data = json.loads(raw)
+        response_json = response.json()
+        raw = _safe_get(response_json, "response", "", context="ollama_response")
+        data = _normalize_analysis_payload(
+            json.loads(raw),
+            context="ollama_response.response",
+        )
         return AIAnalysis(**data)
 
 
