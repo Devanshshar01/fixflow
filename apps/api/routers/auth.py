@@ -277,11 +277,7 @@ async def get_me(current_user: User = Depends(require_auth)):
 async def logout():
     """Clear session cookie and redirect to home."""
     settings = get_settings()
-    frontend_url = (
-        "https://fixflow.vercel.app"
-        if settings.is_production
-        else "http://localhost:3000"
-    )
+    frontend_url = f"{settings.frontend_url}/dashboard"
     response = RedirectResponse(url=frontend_url, status_code=302)
     response.delete_cookie(SESSION_COOKIE_NAME, path="/")
     return response
