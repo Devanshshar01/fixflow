@@ -1,8 +1,6 @@
 from routers import health, webhooks, repositories, analytics
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
-import asyncio
-import importlib
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,33 +10,24 @@ from config import get_settings
 from db import lifespan_db, AsyncSessionLocal
 from logger import logger, setup_logging
 from models.database import WorkflowRun
-
-
-STARTUP_STEP_TIMEOUT_SECONDS = 15
+from routers import health, webhooks, repositories, analytics
+from routers import auth
 
 
 async def _requeue_stuck_runs() -> None:
     """
     On startup: reset any WorkflowRun stuck in 'analyzing' or 'pending'
-    for more than 2 minutes back to 'pending' with retry_count incremented.
-
-    These are jobs that were in-flight when the server last crashed or restarted.
-    They won't be re-triggered by GitHub (webhook already delivered), so we
-    reset them here. A separate process can then re-drive them — for now we
-    just reset status so they're visible and don't block analytics.
+    for more than 2 minutes. These are jobs lost during a previous crash.
     """
-    logger.info("Startup re-queue: start")
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=2)
 
     async with AsyncSessionLocal() as db:
-        logger.info("Startup re-queue: querying stuck runs")
         result = await db.execute(
             select(WorkflowRun).where(
                 WorkflowRun.status.in_(["analyzing", "pending"]),
                 WorkflowRun.triggered_at < cutoff,
             )
         )
-        logger.info("Startup re-queue: query completed")
         stuck_runs = result.scalars().all()
 
         if not stuck_runs:
@@ -57,12 +46,10 @@ async def _requeue_stuck_runs() -> None:
             count=len(stuck_runs),
             run_ids=[str(r.id) for r in stuck_runs],
         )
-    logger.info("Startup re-queue: end")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ── Startup ────────────────────────────────────────────────────────────────
     setup_logging()
     settings = get_settings()
 
@@ -77,7 +64,6 @@ async def lifespan(app: FastAPI):
         logger.info("FixFlow API ready")
         yield
 
-    # ── Shutdown ───────────────────────────────────────────────────────────────
     logger.info("FixFlow API shut down cleanly")
 
 
@@ -93,11 +79,21 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # ── CORS ───────────────────────────────────────────────────────────────────
     origins = (
-        ["http://localhost:3000", "http://127.0.0.1:3000"]
-        if not settings.is_production
-        else ["https://fixflow.vercel.app"]
+    ["http://localhost:3000", "http://127.0.0.1:3000"]
+    if not settings.is_production
+    else [
+        "https://fixflow.vercel.app",
+    ]
+)
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_origin_regex=r"https://.*\.vercel\.app",
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
 
     app.add_middleware(
@@ -108,11 +104,11 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # ── Routers ────────────────────────────────────────────────────────────────
     app.include_router(health.router)
     app.include_router(webhooks.router)
     app.include_router(repositories.router)
     app.include_router(analytics.router)
+    app.include_router(auth.router)
 
     return app
 
