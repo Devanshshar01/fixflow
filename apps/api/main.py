@@ -1,8 +1,9 @@
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
 from config import get_settings
@@ -66,7 +67,6 @@ async def lifespan(app: FastAPI):
         "FixFlow API starting",
         environment=settings.environment,
         ai_provider=settings.ai_provider,
-        frontend_url=settings.frontend_url,
     )
 
     async with lifespan_db():
@@ -88,22 +88,35 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # Hardcoded CORS — explicit list, no env var dependency
-    allowed_origins = [
-        "https://fixflow-henna-alpha.vercel.app",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ]
-
+    # ── CORS — must be added before any other middleware ───────────────────────
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=allowed_origins,
+        allow_origins=[
+            "https://fixflow-henna-alpha.vercel.app",
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+        ],
         allow_credentials=True,
-        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_methods=["*"],
         allow_headers=["*"],
-        expose_headers=["*"],
+        max_age=86400,
     )
 
+    # ── Explicit OPTIONS handler — catches preflight before routing ────────────
+    @app.options("/{rest_of_path:path}")
+    async def preflight_handler(request: Request, rest_of_path: str):
+        return JSONResponse(
+            content={},
+            headers={
+                "Access-Control-Allow-Origin": "https://fixflow-henna-alpha.vercel.app",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Allow-Credentials": "true",
+                "Access-Control-Max-Age": "86400",
+            },
+        )
+
+    # ── Routers ────────────────────────────────────────────────────────────────
     app.include_router(health.router)
     app.include_router(webhooks.router)
     app.include_router(repositories.router)
