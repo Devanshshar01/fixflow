@@ -6,13 +6,13 @@ export function cn(...inputs: ClassValue[]) {
 }
 
 export function formatMs(ms: number | null | undefined): string {
-  if (ms == null) return "—";
+  if (ms == null) return "-";
   if (ms < 1000) return `${ms}ms`;
   return `${(ms / 1000).toFixed(1)}s`;
 }
 
 export function formatDate(iso: string | null | undefined): string {
-  if (!iso) return "—";
+  if (!iso) return "-";
   return new Intl.DateTimeFormat("en", {
     month: "short",
     day: "numeric",
@@ -22,7 +22,7 @@ export function formatDate(iso: string | null | undefined): string {
 }
 
 export function formatRelative(iso: string | null | undefined): string {
-  if (!iso) return "—";
+  if (!iso) return "-";
   const diff = Date.now() - new Date(iso).getTime();
   const minutes = Math.floor(diff / 60_000);
   if (minutes < 1) return "just now";
@@ -33,11 +33,11 @@ export function formatRelative(iso: string | null | undefined): string {
   return `${days}d ago`;
 }
 
-export function confidenceLabel(confidence: number | null): {
+export function confidenceLabel(confidence: number | null | undefined): {
   label: string;
   className: string;
 } {
-  if (confidence === null || confidence === 100)
+  if (confidence == null || confidence === 100)
     return { label: "Deterministic", className: "badge-green" };
   if (confidence >= 75)
     return { label: `${confidence}% confident`, className: "badge-green" };
@@ -62,6 +62,10 @@ export function categoryColor(category: string): string {
     node: "badge-blue",
     python: "badge-blue",
     docker: "badge-gray",
+    go: "badge-gray",
+    rust: "badge-gray",
+    java: "badge-gray",
+    ruby: "badge-gray",
     testing: "badge-amber",
     permissions: "badge-red",
     secrets: "badge-red",
@@ -69,4 +73,22 @@ export function categoryColor(category: string): string {
     unknown: "badge-gray",
   };
   return map[category] ?? "badge-gray";
+}
+
+export function severityColor(severity: string): string {
+  const map: Record<string, string> = {
+    critical: "badge-red",
+    high: "badge-amber",
+    medium: "badge-blue",
+    low: "badge-gray",
+  };
+  return map[severity] ?? "badge-gray";
+}
+
+export function pluralize(
+  count: number,
+  singular: string,
+  plural?: string
+): string {
+  return count === 1 ? singular : plural ?? `${singular}s`;
 }

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { authApi, reposApi, analyticsApi } from "./api";
 import type {
   User,
@@ -8,9 +8,8 @@ import type {
   WorkflowRun,
   AnalyticsSummary,
   Installation,
+  PatternStat,
 } from "./api";
-
-// ── useUser ────────────────────────────────────────────────────────────────────
 
 export function useUser() {
   const [user, setUser] = useState<User | null>(null);
@@ -30,8 +29,6 @@ export function useUser() {
 
   return { user, loading, error };
 }
-
-// ── useRepositories ────────────────────────────────────────────────────────────
 
 export function useRepositories() {
   const [repos, setRepos] = useState<Repository[]>([]);
@@ -58,46 +55,82 @@ export function useRepositories() {
   return { repos, installations, loading, error, refresh };
 }
 
-// ── useRepoFailures ────────────────────────────────────────────────────────────
-
-export function useRepoFailures(repoId: string, limit = 20, offset = 0) {
+export function useRepoFailures(
+  repoId: string,
+  limit = 20,
+  offset = 0,
+  pollIntervalMs = 30_000
+) {
   const [runs, setRuns] = useState<WorkflowRun[]>([]);
   const [total, setTotal] = useState(0);
   const [repoName, setRepoName] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  useEffect(() => {
+  const fetchData = useCallback(() => {
     if (!repoId) return;
-    setLoading(true);
     reposApi
       .failures(repoId, { limit, offset })
       .then((data) => {
         setRuns(data.failures);
         setTotal(data.total);
         setRepoName(data.repository.full_name);
+        setError(null);
       })
       .catch(setError)
       .finally(() => setLoading(false));
   }, [repoId, limit, offset]);
 
-  return { runs, total, repoName, loading, error };
+  useEffect(() => {
+    setLoading(true);
+    fetchData();
+    timerRef.current = setInterval(fetchData, pollIntervalMs);
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current);
+    };
+  }, [fetchData, pollIntervalMs]);
+
+  return { runs, total, repoName, loading, error, refresh: fetchData };
 }
 
-// ── useAnalyticsSummary ────────────────────────────────────────────────────────
-
-export function useAnalyticsSummary() {
+export function useAnalyticsSummary(pollIntervalMs = 60_000) {
   const [summary, setSummary] = useState<AnalyticsSummary | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<Error | null>(null);
+
+  const fetchData = useCallback(() => {
+    analyticsApi
+      .summary()
+      .then((data) => {
+        setSummary(data);
+        setError(null);
+      })
+      .catch(setError)
+      .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => {
+    fetchData();
+    const timer = setInterval(fetchData, pollIntervalMs);
+    return () => clearInterval(timer);
+  }, [fetchData, pollIntervalMs]);
+
+  return { summary, loading, error, refresh: fetchData };
+}
+
+export function usePatternStats(limit = 20) {
+  const [patterns, setPatterns] = useState<PatternStat[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
 
   useEffect(() => {
     analyticsApi
-      .summary()
-      .then(setSummary)
+      .patterns(limit)
+      .then((data) => setPatterns(data.patterns))
       .catch(setError)
       .finally(() => setLoading(false));
-  }, []);
+  }, [limit]);
 
-  return { summary, loading, error };
-}   
+  return { patterns, loading, error };
+}
