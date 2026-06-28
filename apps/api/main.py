@@ -1,4 +1,3 @@
-from routers import health, webhooks, repositories, analytics
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 
@@ -15,37 +14,47 @@ from routers import auth
 
 
 async def _requeue_stuck_runs() -> None:
-    """
-    On startup: reset any WorkflowRun stuck in 'analyzing' or 'pending'
-    for more than 2 minutes. These are jobs lost during a previous crash.
-    """
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=2)
-
     async with AsyncSessionLocal() as db:
-        result = await db.execute(
-            select(WorkflowRun).where(
-                WorkflowRun.status.in_(["analyzing", "pending"]),
-                WorkflowRun.triggered_at < cutoff,
+        logger.info("Startup re-queue: start")
+        try:
+            logger.info("Startup re-queue: querying stuck runs")
+            result = await db.execute(
+                select(WorkflowRun).where(
+                    WorkflowRun.status.in_(["analyzing", "pending"]),
+                    WorkflowRun.triggered_at < cutoff,
+                )
             )
-        )
-        stuck_runs = result.scalars().all()
+            stuck_runs = result.scalars().all()
+            logger.info("Startup re-queue: query completed")
 
-        if not stuck_runs:
-            logger.info("Startup re-queue: no stuck runs found")
-            return
+            if not stuck_runs:
+                logger.info("Startup re-queue: no stuck runs found")
+                return
 
-        for run in stuck_runs:
-            run.status = "failed"
-            run.error_detail = "server_restart_during_analysis"
-            run.retry_count += 1
+            for run in stuck_runs:
+                run.status = "failed"
+                run.error_detail = "server_restart_during_analysis"
+                run.retry_count += 1
 
-        await db.commit()
+            await db.commit()
+            logger.warning(
+                "Startup re-queue: marked stuck runs as failed",
+                count=len(stuck_runs),
+            )
+        except Exception as exc:
+            logger.error("Startup re-queue: failed", error=str(exc), exc_info=True)
 
-        logger.warning(
-            "Startup re-queue: marked stuck runs as failed",
-            count=len(stuck_runs),
-            run_ids=[str(r.id) for r in stuck_runs],
-        )
+
+def _preload_rule_engine() -> None:
+    try:
+        from services.rule_engine import _load_patterns
+        patterns = _load_patterns()
+        logger.info("Rule engine pre-loaded", pattern_count=len(patterns))
+        if len(patterns) == 0:
+            logger.warning("Rule engine has 0 patterns")
+    except Exception as exc:
+        logger.error("Rule engine pre-load failed", error=str(exc), exc_info=True)
 
 
 @asynccontextmanager
@@ -57,10 +66,12 @@ async def lifespan(app: FastAPI):
         "FixFlow API starting",
         environment=settings.environment,
         ai_provider=settings.ai_provider,
+        frontend_url=settings.frontend_url,
     )
 
     async with lifespan_db():
         await _requeue_stuck_runs()
+        _preload_rule_engine()
         logger.info("FixFlow API ready")
         yield
 
@@ -68,40 +79,29 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
-    settings = get_settings()
-
     app = FastAPI(
         title="FixFlow API",
         description="GitHub App that debugs your CI failures",
-        version="0.1.0",
-        docs_url="/docs" if not settings.is_production else None,
-        redoc_url="/redoc" if not settings.is_production else None,
+        version="1.0.0",
+        docs_url=None,
+        redoc_url=None,
         lifespan=lifespan,
     )
 
-    origins = (
-    ["http://localhost:3000", "http://127.0.0.1:3000"]
-    if not settings.is_production
-    else [
-        "https://fixflow.vercel.app",
+    # Hardcoded CORS — explicit list, no env var dependency
+    allowed_origins = [
+        "https://fixflow-henna-alpha.vercel.app",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
     ]
-)
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=origins,
-        allow_origin_regex=r"https://.*\.vercel\.app",
+        allow_origins=allowed_origins,
         allow_credentials=True,
-        allow_methods=["*"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["*"],
-    )
-
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=origins,
-        allow_credentials=True,
-        allow_methods=["GET", "POST", "PATCH", "DELETE"],
-        allow_headers=["*"],
+        expose_headers=["*"],
     )
 
     app.include_router(health.router)
