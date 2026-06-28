@@ -1,15 +1,16 @@
 "use client";
 
 import { useEffect } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useRouter } from "next/navigation";
 import { tokenStore } from "@/lib/api";
 import { Terminal } from "lucide-react";
 
-export default function AuthCallbackInner() {
+export default function AuthCallbackPage() {
   const router = useRouter();
-  const params = useSearchParams();
 
   useEffect(() => {
+    // Read token directly from window.location — no useSearchParams needed
+    const params = new URLSearchParams(window.location.search);
     const token = params.get("token");
 
     if (!token) {
@@ -19,7 +20,7 @@ export default function AuthCallbackInner() {
 
     tokenStore.set(token);
     router.replace("/dashboard");
-  }, [params, router]);
+  }, [router]);
 
   return (
     <div className="min-h-screen bg-white flex flex-col items-center justify-center gap-4">
